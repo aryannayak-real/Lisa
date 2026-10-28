@@ -1,0 +1,692 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { randomUUID } from 'node:crypto'
+
+import { Tool } from '@sdk/base-tool'
+import { ToolkitConfig } from '@sdk/toolkit-config'
+import { ToolRuntimeLifetime } from '@bridge/tool-runtime-types'
+import type { ReusableToolContext } from '@@/bridges/runtime/contracts/tool-runtime-types'
+import { PROFILE_SESSIONS_PATH } from '@bridge/constants'
+import type { DocumentReader, DocumentReadOptions, PDFReadOptions, ImageReadOptions } from './lib/document-reader'
+import { contentHash, patchTextFile, type TextChange, type PatchOptions } from './lib/text-patch'
+
+// Leave room for metadata and JSON escaping in inline tool observations.
+const DEFAULT_MAX_CHARS = 20_000
+const MAX_CHARS = 250_000
+const BINARY_SAMPLE_BYTES = 8_192
+const REPOSITORY_MARKER = '.git'
+const REPOSITORY_INSTRUCTIONS_FILE = 'AGENTS.md'
+
+interface RepositoryInstructions extends ReusableToolContext {
+  path: string
+}
+
+interface ReadOptions {
+  allowMissing?: boolean
+  head?: number
+  tail?: number
+  startLine?: number
+  endLine?: number
+  maxChars?: number
+  offsetChars?: number
+}
+
+interface WriteOptions {
+  overwrite?: boolean
+  createParents?: boolean
+}
+
+interface AppendOptions {
+  createParents?: boolean
+}
+
+export default class FileTool extends Tool {
+  public readonly runtimeLifetime = ToolRuntimeLifetime.Persistent
+  private static readonly TOOLKIT = 'file_system'
+  private readonly config: ReturnType<typeof ToolkitConfig.load>
+  private documentReader?: DocumentReader
+
+  constructor() {
+    super()
+    this.config = ToolkitConfig.load(FileTool.TOOLKIT, this.toolName)
+  }
+
+  get toolName(): string {
+    return 'file'
+  }
+
+  get toolkit(): string {
+    return FileTool.TOOLKIT
+  }
+
+  get description(): string {
+    return this.config['description']
+  }
+
+  /**
+   * Delivers a completed local file through the shared artifact contract.
+   */
+  public async attach(
+    targetPath: string,
+    mimeType: string
+  ): Promise<Record<string, unknown>> {
+    return {
+      artifacts: [
+        await this.createArtifact(this.resolvePath(targetPath), mimeType)
+      ]
+    }
+  }
+
+  /**
+   * Extract PDF pages once and reuse their text across subsequent reads.
+   */
+  public async readPdf(targetPath: string, options: PDFReadOptions = {}): Promise<Record<string, unknown>> {
+    try {
+      const reader = await this.getDocumentReader()
+      const result = await reader.readPdf(this.resolvePath(targetPath), options)
+      this.attachModelFiles(result.files)
+      return { success: true, data: result.data }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
+  /**
+   * Extract image text locally, with optional model-facing visual evidence.
+   */
+  public async readImage(targetPath: string, options: ImageReadOptions = {}): Promise<Record<string, unknown>> {
+    try {
+      const reader = await this.getDocumentReader()
+      const result = await reader.readImage(this.resolvePath(targetPath), options)
+      this.attachModelFiles(result.files)
+      return { success: true, data: result.data }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
+  /**
+   * Read Office and PDF documents through the same bounded extraction path.
+   */
+  public async readDocument(targetPath: string, options: DocumentReadOptions = {}): Promise<Record<string, unknown>> {
+    try {
+      return { success: true, data: await (await this.getDocumentReader()).readDocument(this.resolvePath(targetPath), options) }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
+  /**
+   * Prepare document text for searches using the existing ripgrep tool.
+   */
+  public async prepareDocumentSearch(
+    paths: string[],
+    options: { ocr?: boolean } = {}
+  ): Promise<Record<string, unknown>> {
+    const sessionId = this.executionContext?.conversationSessionId
+
+    if (!sessionId) {
+      throw new Error('Document search preparation requires a conversation session.')
+    }
+
+    const { prepareDocumentSearch } = await import('./lib/document-search')
+    const directory = path.join(
+      PROFILE_SESSIONS_PATH,
+      encodeURIComponent(sessionId),
+      'artifacts',
+      'document-search'
+    )
+
+    return prepareDocumentSearch(
+      await this.getDocumentReader(),
+      paths.map((source) => this.resolvePath(source)),
+      directory,
+      options.ocr ?? false
+    )
+  }
+
+  /**
+   * Retained OCR/PDF workers must not outlive the profile tool runtime.
+   */
+  public async dispose(): Promise<void> {
+    await this.documentReader?.dispose()
+  }
+
+  private async getDocumentReader(): Promise<DocumentReader> {
+    // Plain file operations should not initialize the PDF and canvas runtimes.
+    if (!this.documentReader) {
+      const { DocumentReader } = await import('./lib/document-reader')
+      // Separate groups avoid collisions between the official inference.onnx filenames.
+      this.documentReader = new DocumentReader(undefined, () => Promise.all([
+        this.getResourcePath('PaddleOCR-v6-small-det'),
+        this.getResourcePath('PaddleOCR-v6-small-rec'),
+        this.getResourcePath('RapidOCR-text-orientation')
+      ]))
+    }
+    return this.documentReader
+  }
+
+  /**
+   * Read bounded text, optionally treating an absent file as an expected result.
+   */
+  public async read(
+    targetPath: string,
+    options: ReadOptions = {}
+  ): Promise<{
+    success: boolean
+    exists?: boolean
+    data?: {
+      path: string
+      content: string
+      contentHash: string
+      size: number
+      returnedChars: number
+      totalChars: number
+      truncated: boolean
+      offsetChars: number
+      nextOffsetChars: number | null
+      repositoryInstructions?: RepositoryInstructions[]
+    }
+    error?: string
+  }> {
+    const resolvedPath = this.resolvePath(targetPath)
+
+    if (options.head !== undefined && options.tail !== undefined) {
+      return {
+        success: false,
+        error: 'Use either head or tail, not both.'
+      }
+    }
+
+    const hasLineRange = options.startLine !== undefined || options.endLine !== undefined
+    const startLine = options.startLine ?? 1
+    const endLine = options.endLine ?? Number.MAX_SAFE_INTEGER
+
+    if (hasLineRange && (
+      !Number.isSafeInteger(startLine) || startLine < 1 ||
+      !Number.isSafeInteger(endLine) || endLine < startLine
+    )) {
+      return {
+        success: false,
+        error: 'Line numbers must be positive integers with endLine >= startLine.'
+      }
+    }
+
+    if (hasLineRange && (
+      options.head !== undefined || options.tail !== undefined ||
+      options.offsetChars !== undefined
+    )) {
+      return {
+        success: false,
+        error: 'Use line ranges separately from head, tail, or offsetChars.'
+      }
+    }
+
+    const readable = await this.assertReadableTextFile(resolvedPath)
+
+    if (!readable.success) {
+      if (options.allowMissing === true && readable.exists === false) {
+        return { success: true, exists: false }
+      }
+
+      return readable
+    }
+
+    const bytes = await fs.promises.readFile(resolvedPath)
+    const content = bytes.toString('utf8')
+    const totalChars = content.length
+    let selectedContent = content
+    let offsetChars = this.clampNumber(options.offsetChars, 0, totalChars, 0)
+
+    if (options.head !== undefined) {
+      selectedContent = content
+        .split('\n')
+        .slice(0, this.clampNumber(options.head, 0, Number.MAX_SAFE_INTEGER, 0))
+        .join('\n')
+      offsetChars = 0
+    } else if (options.tail !== undefined) {
+      selectedContent = content
+        .split('\n')
+        .slice(-this.clampNumber(options.tail, 0, Number.MAX_SAFE_INTEGER, 0))
+        .join('\n')
+      offsetChars = Math.max(0, totalChars - selectedContent.length)
+    } else if (hasLineRange) {
+      // Search locations are line numbers; preserve original separators and
+      // character offsets so bounded pages can still resume without gaps.
+      let line = 1
+      let lineOffset = 0
+      let endOffset = totalChars
+      offsetChars = totalChars
+
+      while (line <= endLine) {
+        if (line === startLine) {
+          offsetChars = lineOffset
+        }
+
+        const newlineOffset = content.indexOf('\n', lineOffset)
+
+        if (newlineOffset === -1) {
+          break
+        }
+
+        lineOffset = newlineOffset + 1
+        if (line === endLine) {
+          endOffset = lineOffset
+          break
+        }
+
+        line += 1
+      }
+
+      selectedContent = content.slice(offsetChars, endOffset)
+    } else {
+      selectedContent = content.slice(offsetChars)
+    }
+
+    const maxChars = this.clampNumber(options.maxChars, 1, MAX_CHARS, DEFAULT_MAX_CHARS)
+    const returnedContent = selectedContent.slice(0, maxChars)
+    const nextOffsetChars = offsetChars + returnedContent.length
+    const truncated =
+      returnedContent.length < selectedContent.length || nextOffsetChars < totalChars
+    const repositoryInstructions = await this.readRepositoryInstructions(resolvedPath)
+
+    return {
+      success: true,
+      ...(options.allowMissing === true ? { exists: true } : {}),
+      data: {
+        path: resolvedPath,
+        content: returnedContent,
+        contentHash: contentHash(bytes),
+        size: readable.size || 0,
+        returnedChars: returnedContent.length,
+        totalChars,
+        truncated,
+        offsetChars,
+        nextOffsetChars: truncated ? nextOffsetChars : null,
+        ...(repositoryInstructions.length > 0 ? { repositoryInstructions } : {})
+      }
+    }
+  }
+
+  public async readToolArtifact(
+    outputLogPath: string,
+    options: Pick<ReadOptions, 'maxChars' | 'offsetChars'> = {}
+  ): Promise<{
+    success: boolean
+    data?: {
+      path: string
+      content: string
+      size: number
+      returnedChars: number
+      totalChars: number
+      truncated: boolean
+      offsetChars: number
+      nextOffsetChars: number | null
+    }
+    error?: string
+  }> {
+    return this.read(outputLogPath, {
+      maxChars: options.maxChars ?? DEFAULT_MAX_CHARS,
+      offsetChars: options.offsetChars ?? 0
+    })
+  }
+
+  /**
+   * Reuse existing text by reference while retaining ordinary write safeguards.
+   */
+  public async copyText(
+    sourcePath: string,
+    targetPath: string,
+    options: WriteOptions = {}
+  ): Promise<Record<string, unknown>> {
+    const source = this.resolvePath(sourcePath)
+    const readable = await this.assertReadableTextFile(source)
+
+    if (!readable.success) {
+      return readable
+    }
+
+    const bytes = await fs.promises.readFile(source)
+    const content = bytes.toString('utf8')
+
+    if (!Buffer.from(content, 'utf8').equals(bytes)) {
+      return { success: false, error: 'Text copying requires valid UTF-8 bytes.' }
+    }
+
+    const result = await this.write(targetPath, content, options)
+
+    if (!result.success || !result.data) {
+      return result
+    }
+
+    const sourceContentHash = contentHash(bytes)
+    const destinationContentHash = contentHash(
+      await fs.promises.readFile(result.data.path)
+    )
+    const matches = sourceContentHash === destinationContentHash
+
+    return {
+      ...result,
+      success: matches,
+      sourcePath: source,
+      sourceContentHash,
+      destinationContentHash,
+      ...(!matches ? { error: 'Destination changed before copy verification.' } : {})
+    }
+  }
+
+  /**
+   * Preserve the exact existing bytes before replacing a file's entire content.
+   */
+  public async write(
+    targetPath: string,
+    content: string,
+    options: WriteOptions = {}
+  ): Promise<{
+    success: boolean
+    data?: {
+      path: string
+      bytesWritten: number
+      backupPath?: string
+      backupContentHash?: string
+    }
+    error?: string
+  }> {
+    const resolvedPath = this.resolvePath(targetPath)
+
+    if (options.createParents) {
+      await fs.promises.mkdir(path.dirname(resolvedPath), { recursive: true })
+    }
+
+    // Exclusive creation also protects a file created after destination discovery.
+    try {
+      await fs.promises.writeFile(resolvedPath, content, { encoding: 'utf8', flag: 'wx' })
+
+      return {
+        success: true,
+        data: {
+          path: resolvedPath,
+          bytesWritten: Buffer.byteLength(content, 'utf8')
+        }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw error
+      }
+    }
+
+    if (options.overwrite !== true) {
+      return {
+        success: false,
+        error: 'File already exists. Read it first and prefer patch for edits. For a full replacement, use overwrite=true; the original will be preserved automatically.'
+      }
+    }
+
+    const stat = await fs.promises.lstat(resolvedPath)
+    if (!stat.isFile() || stat.nlink > 1) {
+      return {
+        success: false,
+        error: 'Full replacement requires a regular file without hard-link aliases.'
+      }
+    }
+
+    const original = await fs.promises.readFile(resolvedPath)
+    const originalHash = contentHash(original)
+    const backupPath = `${resolvedPath}.${randomUUID()}.bak`
+    const temporaryPath = path.join(
+      path.dirname(resolvedPath),
+      `.${path.basename(resolvedPath)}.${randomUUID()}.tmp`
+    )
+
+    // Save beside the destination so the owner can recover it without session state.
+    await fs.promises.writeFile(backupPath, original, { flag: 'wx', mode: stat.mode })
+
+    try {
+      const temporary = await fs.promises.open(temporaryPath, 'wx', stat.mode)
+      try {
+        await temporary.writeFile(content, 'utf8')
+        await temporary.chmod(stat.mode)
+        await temporary.sync()
+      } finally {
+        await temporary.close()
+      }
+
+      // As with patches, detect intervening edits before replacing the directory entry.
+      const currentStat = await fs.promises.lstat(resolvedPath)
+      if (currentStat.ino !== stat.ino || currentStat.dev !== stat.dev
+        || contentHash(await fs.promises.readFile(resolvedPath)) !== originalHash) {
+        throw new Error('File changed while preparing the replacement. Read it again.')
+      }
+
+      await fs.promises.rename(temporaryPath, resolvedPath)
+    } catch (error) {
+      return {
+        success: false,
+        data: {
+          path: resolvedPath,
+          bytesWritten: 0,
+          backupPath,
+          backupContentHash: originalHash
+        },
+        error: error instanceof Error ? error.message : String(error)
+      }
+    } finally {
+      await fs.promises.rm(temporaryPath, { force: true })
+    }
+
+    return {
+      success: true,
+      data: {
+        path: resolvedPath,
+        bytesWritten: Buffer.byteLength(content, 'utf8'),
+        backupPath,
+        backupContentHash: originalHash
+      }
+    }
+  }
+
+  /**
+   * Apply targeted changes without rewriting unrelated content from a stale view.
+   */
+  public async patch(
+    targetPath: string,
+    changes: TextChange[],
+    options: PatchOptions = {}
+  ): Promise<Record<string, unknown>> {
+    const resolvedPath = this.resolvePath(targetPath)
+    const readable = await this.assertReadableTextFile(resolvedPath)
+    if (!readable.success) {
+      return readable
+    }
+
+    try {
+      return { success: true, data: await patchTextFile(resolvedPath, changes, options) }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
+  public async append(
+    targetPath: string,
+    content: string,
+    options: AppendOptions = {}
+  ): Promise<{
+    success: boolean
+    data?: { path: string, bytesWritten: number }
+    error?: string
+  }> {
+    const resolvedPath = this.resolvePath(targetPath)
+
+    if (options.createParents) {
+      await fs.promises.mkdir(path.dirname(resolvedPath), { recursive: true })
+    }
+
+    await fs.promises.appendFile(resolvedPath, content, 'utf8')
+
+    return {
+      success: true,
+      data: {
+        path: resolvedPath,
+        bytesWritten: Buffer.byteLength(content, 'utf8')
+      }
+    }
+  }
+
+  private resolvePath(inputPath: string): string {
+    const trimmedPath = String(inputPath || '').trim()
+
+    if (trimmedPath === '~') {
+      return os.homedir()
+    }
+
+    if (trimmedPath.startsWith('~/') || trimmedPath.startsWith('~\\')) {
+      return path.resolve(os.homedir(), trimmedPath.slice(2))
+    }
+
+    return path.resolve(trimmedPath)
+  }
+
+  /**
+   * Deliver current repository rules with source text before an agent edits it.
+   */
+  private async readRepositoryInstructions(targetPath: string): Promise<RepositoryInstructions[]> {
+    const directories: string[] = []
+    let directory = path.dirname(targetPath)
+
+    // The nearest repository owns its subtree; unrelated parent rules do not.
+    while (true) {
+      directories.push(directory)
+
+      if (await this.safeLstat(path.join(directory, REPOSITORY_MARKER))) {
+        break
+      }
+
+      const parent = path.dirname(directory)
+
+      if (parent === directory) {
+        return []
+      }
+
+      directory = parent
+    }
+
+    const instructions = await Promise.all(directories.reverse().map(async (ancestor) => {
+      const instructionPath = path.join(ancestor, REPOSITORY_INSTRUCTIONS_FILE)
+
+      if (instructionPath === targetPath) {
+        return null
+      }
+
+      const readable = await this.assertReadableTextFile(instructionPath)
+
+      if (!readable.success) {
+        if (await this.safeLstat(instructionPath)) {
+          throw new Error(readable.error)
+        }
+
+        return null
+      }
+
+      return {
+        path: instructionPath,
+        modelContextId: instructionPath,
+        content: await fs.promises.readFile(instructionPath, 'utf8')
+      }
+    }))
+
+    return instructions.filter((entry): entry is RepositoryInstructions => entry !== null)
+  }
+
+  private async assertReadableTextFile(targetPath: string): Promise<{
+    success: false
+    exists?: false
+    error: string
+    size?: never
+  } | {
+    success: true
+    size: number
+  }> {
+    const stat = await this.safeLstat(targetPath)
+
+    if (!stat) {
+      return {
+        success: false,
+        exists: false,
+        error: `File not found: ${targetPath}`
+      }
+    }
+
+    if (!stat.isFile()) {
+      return {
+        success: false,
+        error: `Path is not a file: ${targetPath}`
+      }
+    }
+
+    if (await this.isLikelyBinary(targetPath)) {
+      return {
+        success: false,
+        error: `Refusing to read likely binary file: ${targetPath}`
+      }
+    }
+
+    return {
+      success: true,
+      size: stat.size
+    }
+  }
+
+  private async isLikelyBinary(targetPath: string): Promise<boolean> {
+    const fileHandle = await fs.promises.open(targetPath, 'r')
+    try {
+      const buffer = Buffer.alloc(BINARY_SAMPLE_BYTES)
+      const { bytesRead } = await fileHandle.read(buffer, 0, buffer.length, 0)
+      const sample = buffer.subarray(0, bytesRead)
+
+      if (sample.includes(0)) {
+        return true
+      }
+
+      let suspiciousControlChars = 0
+      for (const byte of sample) {
+        if (byte < 7 || (byte > 13 && byte < 32)) {
+          suspiciousControlChars += 1
+        }
+      }
+
+      return bytesRead > 0 && suspiciousControlChars / bytesRead > 0.1
+    } finally {
+      await fileHandle.close()
+    }
+  }
+
+  private clampNumber(
+    value: unknown,
+    min: number,
+    max: number,
+    fallback: number
+  ): number {
+    const numericValue = Number(value)
+
+    if (!Number.isFinite(numericValue)) {
+      return fallback
+    }
+
+    return Math.min(Math.max(Math.floor(numericValue), min), max)
+  }
+
+  private async safeLstat(targetPath: string): Promise<fs.Stats | null> {
+    try {
+      return await fs.promises.lstat(targetPath)
+    } catch (error) {
+      // Only absence is an expected lookup result; access and I/O errors must fail.
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return null
+      }
+
+      throw error
+    }
+  }
+
+}

@@ -1,0 +1,23 @@
+.border-wave
+  position: absolute
+  inset: 0
+  width: 100%
+  height: 100%
+  contain: strict
+  overflow: visible
+  pointer-events: none
+  // Canvas owns the fade; this clock only signals when a focus sweep finishes.
+  animation: border-wave-sweep linear both
+
+.border-wave-repeating
+  animation: none
+
+@keyframes border-wave-sweep
+  from,
+  to
+    opacity: 1
+
+@media (prefers-reduced-motion: reduce)
+  .border-wave
+    display: none
+    animation: none

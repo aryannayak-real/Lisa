@@ -1,0 +1,16 @@
+{
+  "$schema": "../../schemas/toolkit-schemas/toolkit.json",
+  "name": "Structured Knowledge",
+  "description": "Recall personal memories, read owner/device context, search prior conversations, and query structured data.",
+  "icon_name": "database-2-line",
+  "context_files": [
+    "LEON.md",
+    "ARCHITECTURE.md"
+  ],
+  "tools": [
+    "memory",
+    "context",
+    "sessions",
+    "duckdb"
+  ]
+}

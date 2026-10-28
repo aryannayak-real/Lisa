@@ -1,0 +1,67 @@
+from dataclasses import dataclass
+from threading import Event
+from typing import Any, Callable, Literal, NotRequired, TypedDict
+
+
+class ToolModelFile(TypedDict):
+    """Model evidence using the same serialized fields as the Node.js SDK."""
+
+    dataBase64: str
+    mediaType: str
+    filename: NotRequired[str]
+    visualDetail: NotRequired[Literal["auto", "low", "high"]]
+
+
+class ToolProgressStream(TypedDict):
+    """Lifetime of progress belonging to retained work."""
+
+    id: str
+    state: Literal["running", "completed", "failed"]
+
+
+class ToolRuntimeProgress(TypedDict):
+    """Progress emitted by a tool during execution."""
+
+    source: Literal["log", "report"]
+    message: str
+    key: NotRequired[str]
+    data: NotRequired[dict[str, Any]]
+    stream: NotRequired[ToolProgressStream]
+    activity: NotRequired[bool]
+
+
+class ToolTimeoutPolicy(TypedDict, total=False):
+    """Optional per-function limits; progress renews idleMs, never totalMs."""
+
+    idleMs: int
+    totalMs: int
+
+
+@dataclass
+class ToolExecutionContext:
+    """Host-owned identity and call state, separate from model arguments.
+
+    A set signal requests cooperative cancellation. Python tools can check
+    signal.is_set() or use signal.wait(timeout) for interruptible waits.
+    """
+
+    toolkit_id: str
+    tool_id: str
+    function_name: str
+    parameters: dict[str, Any]
+    profile_name: str
+    conversation_session_id: str | None
+    connections: dict[str, dict[str, Any]] | None = None
+    leon_service: dict[str, str] | None = None
+    signal: Event | None = None
+    on_progress: Callable[[ToolRuntimeProgress], None] | None = None
+    timeout: ToolTimeoutPolicy | None = None
+
+
+class ToolRuntimeResult(TypedDict):
+    """Execution result with evidence kept outside ordinary tool observations."""
+
+    success: bool
+    message: str
+    output: dict[str, Any]
+    modelFiles: NotRequired[list[ToolModelFile]]

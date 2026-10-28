@@ -1,0 +1,91 @@
+.feed
+  --feed-bottom-clearance: 148px
+  --feed-entry-gap: 42px
+  --feed-scrim-edge-width: 64px
+  --feed-top-clearance: 52px
+  box-sizing: border-box
+  width: 100%
+  padding: var(--feed-top-clearance) 0 var(--feed-bottom-clearance)
+  color: var(--color-feed-text)
+  font-size: var(--font-size-lg)
+  line-height: var(--line-height-lg)
+
+.feed-scrim
+  // A fixed decoration cannot widen the feed's scrollable content on small screens.
+  position: fixed
+  top: 0
+  bottom: 0
+  left: 0
+  z-index: -1
+  width: 100%
+  pointer-events: none
+
+  &::before
+    content: ''
+    position: absolute
+    inset: 0 calc(var(--feed-scrim-edge-width) * -1)
+    // Full coverage reaches both text edges; only the outer margins fade away.
+    background: linear-gradient(90deg, transparent, var(--color-feed-scrim) var(--feed-scrim-edge-width), var(--color-feed-scrim) calc(100% - var(--feed-scrim-edge-width)), transparent)
+
+.feed-virtual-content
+  position: relative
+  width: 100%
+
+.feed-turn
+  position: absolute
+  top: 0
+  left: 0
+  box-sizing: border-box
+  width: 100%
+
+.feed-turn:not(.feed-turn-latest)
+  padding-bottom: calc(var(--feed-entry-gap) + var(--space-xl))
+
+.feed-turn-latest
+  min-height: calc(100vh - var(--feed-top-clearance) - var(--feed-bottom-clearance))
+
+.feed-turn-awaiting-owner .owner-message-animate
+  animation-play-state: paused
+
+.feed-entry:not(:last-child)
+  padding-bottom: var(--feed-entry-gap)
+
+.feed-mask
+  position: fixed
+  left: 0
+  z-index: 2
+  width: 100%
+  pointer-events: none
+
+  &::before
+    content: ''
+    position: absolute
+    // Extend the feather beyond the text column to avoid visible side seams.
+    inset: 0 calc(var(--feed-scrim-edge-width) * -1)
+    background-color: var(--color-feed-mask)
+    -webkit-backdrop-filter: var(--feed-mask-backdrop-filter)
+    backdrop-filter: var(--feed-mask-backdrop-filter)
+    -webkit-mask-image: var(--feed-mask-gradient), linear-gradient(90deg, transparent, #000 var(--feed-scrim-edge-width), #000 calc(100% - var(--feed-scrim-edge-width)), transparent)
+    mask-image: var(--feed-mask-gradient), linear-gradient(90deg, transparent, #000 var(--feed-scrim-edge-width), #000 calc(100% - var(--feed-scrim-edge-width)), transparent)
+    -webkit-mask-composite: source-in
+    mask-composite: intersect
+    transition: background-color var(--transition-duration-main) var(--transition-timing-main)
+
+.feed-mask-top
+  --feed-mask-gradient: linear-gradient(to bottom, #000, transparent)
+  top: 0
+  height: var(--feed-top-clearance)
+
+.feed-mask-bottom
+  --feed-mask-gradient: linear-gradient(to top, #000, transparent)
+  bottom: 0
+  height: var(--feed-bottom-clearance)
+
+@media (max-width: 680px)
+  .feed
+    --feed-bottom-clearance: 132px
+    --feed-top-clearance: var(--space-xl)
+
+@media (prefers-reduced-motion: reduce)
+  .feed-mask::before
+    transition: none

@@ -1,0 +1,189 @@
+.vibes
+  // Scale the dark artwork's feather with the scene to blend into the page.
+  --vibes-edge-blend-width: 12%
+  --vibes-edge-blend-midpoint: calc(var(--vibes-edge-blend-width) * .5)
+  --vibes-top-edge-blend-midpoint: var(--vibes-edge-blend-midpoint)
+  --vibes-top-edge-blend-width: var(--vibes-edge-blend-width)
+  --vibes-inline-edge-mask: linear-gradient(90deg, transparent 0, rgba(0, 0, 0, .5) var(--vibes-edge-blend-midpoint), #000 var(--vibes-edge-blend-width), #000 calc(100% - var(--vibes-edge-blend-width)), rgba(0, 0, 0, .5) calc(100% - var(--vibes-edge-blend-midpoint)), transparent 100%)
+  --vibes-block-edge-mask: linear-gradient(180deg, transparent 0, rgba(0, 0, 0, .5) var(--vibes-top-edge-blend-midpoint), #000 var(--vibes-top-edge-blend-width), #000 100%)
+  --vibes-scene-transition-duration: 30s
+  --vibes-stage-inline-offset: clamp(80px, 5vw, 112px)
+  --vibes-weather-blend-mode: normal
+  --vibes-weather-filter: none
+  --vibes-weather-opacity: 1
+  container: vibes / size
+  position: fixed
+  top: 0
+  right: 0
+  bottom: 0
+  left: var(--active-sidebar-width)
+  z-index: 0
+  overflow: hidden
+  background-color: var(--color-background)
+  contain: strict
+  pointer-events: none
+  transition: left var(--transition-duration-sidebar) var(--transition-timing-sidebar), background-color var(--transition-duration-main) var(--transition-timing-main)
+
+.vibes-frame
+  --vibes-frame-transition-duration: var(--vibes-scene-transition-duration)
+  --vibes-frame-transition-timing: ease-in-out
+  --vibes-scene-brightness: var(--vibes-dark-brightness)
+  --vibes-scene-contrast: var(--vibes-dark-contrast)
+  --vibes-scene-mask-opacity: var(--vibes-dark-mask-opacity)
+  --vibes-scene-opacity: var(--vibes-dark-opacity)
+  --vibes-scene-saturation: var(--vibes-dark-saturation)
+  position: absolute
+  inset: 0
+
+.vibes-frame-active
+  z-index: 1
+
+.vibes-frame-entering
+  z-index: 2
+  animation: vibes-frame-fade-in var(--vibes-frame-transition-duration) var(--vibes-frame-transition-timing) both
+
+.vibes-frame-outgoing
+  z-index: 1
+  animation: vibes-frame-fade-out var(--vibes-frame-transition-duration) var(--vibes-frame-transition-timing) both
+
+.vibes-tone
+  position: absolute
+  inset: 0
+  width: 100%
+  height: 100%
+  background: linear-gradient(90deg, rgba(0, 0, 0, .08), rgba(0, 0, 0, .58) 36%, rgba(0, 0, 0, .62) 64%, rgba(0, 0, 0, .08)), linear-gradient(0deg, rgba(0, 0, 0, .4), transparent 36%, rgba(0, 0, 0, .2))
+  opacity: var(--vibes-scene-mask-opacity)
+
+.vibes-stage
+  position: absolute
+  bottom: 0
+  left: calc(50% + var(--vibes-stage-inline-offset))
+  width: min(100%, 1672px)
+  aspect-ratio: 1672 / 941
+  // Intersect both gradients so every exposed edge reveals the theme background.
+  -webkit-mask-image: var(--vibes-inline-edge-mask), var(--vibes-block-edge-mask)
+  mask-image: var(--vibes-inline-edge-mask), var(--vibes-block-edge-mask)
+  -webkit-mask-composite: source-in
+  mask-composite: intersect
+  -webkit-mask-repeat: no-repeat
+  mask-repeat: no-repeat
+  transform: translateX(-50%) scale(1.05)
+  transform-origin: center bottom
+  transition: opacity var(--transition-duration-main) var(--transition-timing-main)
+
+.vibes-scene
+  position: absolute
+  inset: 0
+  width: 100%
+  height: 100%
+  object-fit: cover
+  object-position: center
+  filter: brightness(var(--vibes-scene-brightness)) contrast(var(--vibes-scene-contrast)) saturate(var(--vibes-scene-saturation))
+  image-rendering: pixelated
+  opacity: var(--vibes-scene-opacity)
+  user-select: none
+
+.vibes-stage-left
+  display: none
+
+.vibes-weather-window
+  position: absolute
+  top: var(--vibes-window-top)
+  right: var(--vibes-window-right)
+  z-index: 2
+  width: var(--vibes-window-width)
+  height: var(--vibes-window-height)
+  overflow: hidden
+  clip-path: var(--vibes-window-weather-clip-path)
+
+  &::after
+    content: ''
+    position: absolute
+    z-index: 1
+    inset: 0
+    background: radial-gradient(ellipse at top left, rgba(232, 242, 250, .2), transparent 22%), radial-gradient(ellipse at top right, rgba(232, 242, 250, .16), transparent 18%), radial-gradient(ellipse at bottom left, rgba(218, 233, 244, .13), transparent 20%), radial-gradient(ellipse at bottom right, rgba(218, 233, 244, .14), transparent 24%)
+    box-shadow: inset 0 0 12px rgba(222, 236, 247, .14)
+    opacity: 0
+    pointer-events: none
+
+.vibes-weather-snow .vibes-weather-window::after
+  opacity: 1
+
+// Each frame uses its authored theme's palette and edge treatment.
+.vibes-frame[data-vibe-theme='light']
+  --vibes-scene-brightness: var(--vibes-light-brightness)
+  --vibes-scene-contrast: var(--vibes-light-contrast)
+  --vibes-scene-mask-opacity: var(--vibes-light-mask-opacity)
+  --vibes-scene-opacity: var(--vibes-light-opacity)
+  --vibes-scene-saturation: var(--vibes-light-saturation)
+  --vibes-weather-opacity: 1
+
+  // Light assets author their white perimeter directly, so masking them would
+  // unnecessarily soften the scene's foreground details.
+  .vibes-stage
+    -webkit-mask-image: none
+    mask-image: none
+
+  .vibes-tone
+    background: rgba(255, 255, 255, .18)
+
+  &.vibes-weather-snow .vibes-weather-window::after
+    background: radial-gradient(ellipse at top left, rgba(88, 112, 132, .13), transparent 22%), radial-gradient(ellipse at top right, rgba(88, 112, 132, .1), transparent 18%), radial-gradient(ellipse at bottom left, rgba(104, 127, 146, .08), transparent 20%), radial-gradient(ellipse at bottom right, rgba(104, 127, 146, .09), transparent 24%)
+    box-shadow: inset 0 0 12px rgba(89, 115, 136, .1)
+
+  &.vibes-weather-drizzle,
+  &.vibes-weather-rain,
+  &.vibes-weather-storm
+    --vibes-weather-blend-mode: multiply
+    --vibes-weather-filter: brightness(.5) contrast(1.4) drop-shadow(0 0 .8px rgba(35, 58, 78, .8))
+
+  &.vibes-weather-snow
+    --vibes-weather-filter: drop-shadow(0 0 1px rgba(48, 65, 82, .95)) drop-shadow(0 1px 1px rgba(67, 83, 101, .8))
+
+@keyframes vibes-frame-fade-in
+  from
+    opacity: 0
+
+  to
+    opacity: 1
+
+@keyframes vibes-frame-fade-out
+  from
+    opacity: 1
+
+  to
+    opacity: 0
+
+// Size decorations to the available canvas, including changes in sidebar width.
+@container vibes (max-width: 1600px)
+  .vibes-stage
+    left: auto
+    // The outer quarter of each view fits the gutters beside the content column.
+    width: min(100cqw, 115cqh, max(640px, calc((100cqw - var(--content-width)) * 1.85)))
+    transform: none
+
+  .vibes-stage-left
+    --vibes-inline-edge-mask: linear-gradient(90deg, transparent, rgba(0, 0, 0, .5) 6%, #000 12%, #000 22%, transparent 36%)
+    display: block
+    left: 0
+
+  .vibes-stage-right
+    --vibes-inline-edge-mask: linear-gradient(90deg, transparent 62%, #000 76%, #000 88%, rgba(0, 0, 0, .5) 94%, transparent)
+    right: 0
+
+  .vibes-frame[data-vibe-theme='light'] .vibes-stage
+    // Retain the authored white perimeter while blending the split inner edges.
+    -webkit-mask-image: var(--vibes-inline-edge-mask)
+    mask-image: var(--vibes-inline-edge-mask)
+
+@media (max-width: 960px)
+  .vibes
+    left: 0
+
+@media (prefers-reduced-motion: reduce)
+  .vibes
+    transition: background-color var(--transition-duration-main) var(--transition-timing-main)
+
+  .vibes-frame-entering,
+  .vibes-frame-outgoing
+    animation: none

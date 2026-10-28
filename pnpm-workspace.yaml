@@ -1,0 +1,29 @@
+# Leon setup depends on native/binary packages whose install scripts must run
+dangerouslyAllowAllBuilds: true
+
+# Restore package sources instead of trusting machine-global cached build output.
+sideEffectsCache: false
+
+# Fail early when the active Node.js version does not satisfy package engines
+engineStrict: true
+
+# Keep dependency versions pinned when adding packages
+saveExact: true
+
+# Allow time for newly published dependencies to receive community scrutiny.
+minimumReleaseAge: 2160
+minimumReleaseAgeStrict: true
+
+# Do not let `pnpm run` auto-install dependencies before running scripts
+verifyDepsBeforeRun: false
+
+# Keep pnpm install output readable without cursor manipulation
+reporter: append-only
+
+# Always run install lifecycle scripts, even when dependencies are up to date
+optimisticRepeatInstall: false
+
+# Leon's postinstall setup also maintains runtimes, skills and tool dependencies.
+# Disable the frozen-lockfile fast path for regular installs so setup can run
+# when those sources change, even if the root dependencies remain unchanged.
+preferFrozenLockfile: false

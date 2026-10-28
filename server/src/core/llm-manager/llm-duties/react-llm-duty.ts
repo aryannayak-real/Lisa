@@ -1,0 +1,2304 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import type { CompletionAccounting, UsageAccounting } from '@/core/llm-manager/llm-usage/usage-accounting'
+import { captureContextUsage, type ContextUsageMetrics } from '@/core/llm-manager/llm-usage/context-usage'
+import { resolveModelContextWindowTokens } from '@/core/llm-manager/model-context-windows'
+import { randomUUID } from 'node:crypto'
+import { AsyncResource } from 'node:async_hooks'
+import { ModelResponseState, type ModelResponseStatus } from '@/core/leon-interface/types'
+
+import {
+  DEFAULT_INIT_PARAMS,
+  LLMDuty,
+  type LLMDutyInitParams,
+  type LLMDutyParams,
+  type LLMDutyResult
+} from '@/core/llm-manager/llm-duty'
+import { LogHelper } from '@/helpers/log-helper'
+import { StringHelper } from '@/helpers/string-helper'
+import {
+  LLM_PROVIDER,
+  PERSONA,
+  TOOLKIT_REGISTRY,
+  CONTEXT_MANAGER,
+  SELF_MODEL_MANAGER,
+  CONVERSATION_LOGGER,
+  SOCKET_SERVER,
+  TOOL_CALL_LOGGER,
+  POST_TURN_MAINTENANCE_QUEUE
+} from '@/core'
+import {
+  LLMDuties,
+  LLMProviders,
+  InferencePurpose,
+  CompletionFailureKind,
+  type LLMReasoningEffort,
+  type ProviderActivitySnapshot,
+  type AgentToolTranscriptMessage,
+  type OpenAITool,
+  type OpenAIToolCall,
+  type ProviderReasoningItem,
+  type ProviderCompactionContext,
+  type ProviderMessageMetadata
+} from '@/core/llm-manager/types'
+import { CONFIG_STATE } from '@/core/config-states/config-state'
+import { getLLMModelCatalogEntry, getLLMModelDefaultReasoning } from '@/core/llm-manager/llm-model-catalog'
+import { SkillDomainHelper } from '@/helpers/skill-domain-helper'
+import { getProfilePaths } from '@/core/profile-runtime/profile-paths'
+import { getConnectionRequirements } from '@/core/connections/connection-catalog'
+import { CONFIG_MANAGER } from '@/config'
+import { CONVERSATION_SESSION_MANAGER } from '@/core/session-manager'
+import { getActiveConversationSessionId } from '@/core/session-manager/session-context'
+
+const TRACE_SAVE_INTERVAL_MS = 1_000
+const MODEL_ACTIVITY_UPDATE_INTERVAL_MS = 1_000
+const IMAGE_INSPECTION_REASONING_EFFORT: LLMReasoningEffort = 'low'
+const COMPLETION_REVIEW_REASONING_EFFORT: LLMReasoningEffort = 'low'
+const CLARIFICATION_REVIEW_REASONING_EFFORT: LLMReasoningEffort = 'low'
+
+function getLLMProviderName(): LLMProviders {
+  const provider = CONFIG_STATE.getModelState().getAgentTarget().provider
+
+  if (!provider) {
+    throw new Error('The agent LLM provider is disabled.')
+  }
+
+  return provider
+}
+
+import {
+  AGENT_TEMPERATURE,
+  AGENT_INFERENCE_TIMEOUT_MS,
+  AGENT_MODEL_RESPONSE_TIMEOUT_MS,
+  AGENT_MODEL_RESPONSE_MAX_DURATION_MS,
+  AGENT_TIMEOUT_MAX_RETRIES,
+  CHARS_PER_TOKEN,
+  AGENT_TOOL_CALL_WAIT_NOTICE_DELAY_MS,
+  AGENT_TOOL_CALL_DIAGNOSIS_DELAY_MS,
+  AGENT_MAX_ITERATIONS,
+  AGENT_FINISHING_ITERATIONS,
+  AGENT_PROMPT_CACHE_KEY,
+  AGENT_CONTINUATION_SUMMARY_MAX_TOKENS,
+  AGENT_CONTINUATION_SUMMARY_TIMEOUT_MS,
+  AGENT_CONTINUATION_SUMMARY_SYSTEM_PROMPT
+} from './react-llm-duty/agent-constants'
+import type {
+  ReactLLMDutyParams,
+  ExecutionRecord,
+  LLMCaller,
+  FinalResponseSignal,
+  AgentPhase,
+  AgentSkillContext,
+  AgentRunProgressEvent
+} from './react-llm-duty/agent-types'
+import { AGENT_PLAN_GUIDANCE } from './react-llm-duty/agent-plan'
+import { widgetId, emitPlanWidget } from './react-llm-duty/plan-widget'
+import { AgentAnswerStream } from './react-llm-duty/agent-answer-stream'
+import {
+  getAgentInferencePolicy,
+  formatAgentInferencePolicyForLog,
+  type AgentInferencePolicy
+} from './react-llm-duty/agent-policy'
+import { parseToolCallArguments } from './react-llm-duty/agent-utils'
+import {
+  runToolExecution,
+  getToolDisplayContext,
+  emitToolExecutionInputToWebApp,
+  emitToolExecutionOutputToWebApp
+} from './react-llm-duty/tool-execution'
+import {
+  AGENT_COMPLETION_REVIEW_SCHEMA,
+  AGENT_LIMIT_FINALIZATION_SYSTEM_PROMPT,
+  AGENT_SYSTEM_PROMPT,
+  AgentModelProviderError,
+  AgentModelResponseTimeoutError,
+  buildAgentConnectionGuidance,
+  buildAgentToolCatalog,
+  buildAgentTranscriptHistory,
+  evaluateAgentToolkitPreloadCost,
+  findHighConfidenceAgentToolSelection,
+  runAgentLoop
+} from './react-llm-duty/agent-loop'
+import type { AgentCallableFunction, AgentLoopResult } from './react-llm-duty/agent-loop'
+import { appendAgentRuntimeContext, buildToolkitContextSection } from './react-llm-duty/agent-helpers'
+import { AgentRunBudget } from './react-llm-duty/agent-run-budget'
+import {
+  type AccumulatedLLMMetricsState,
+  type FinalAnswerMetricsSnapshot,
+  type RawPhaseMetrics,
+  deriveLLMMetrics,
+  observeCompletionMetrics
+} from './react-llm-duty/agent-metrics'
+import {
+  createAgentLoopContinuationState,
+  buildAgentContinuationTranscript,
+  isAgentLoopContinuationStateValid,
+  type AgentContinuityCheckpointInput,
+  type AgentLoopContinuationState
+} from './react-llm-duty/agent-loop-continuation'
+import { restoreCompactionSources } from '@/core/llm-manager/provider-compaction'
+import {
+  prepareAgentModelContext,
+  retainRecentToolImages,
+  resolveAgentContextCompactionTriggerTokens,
+  resolveAgentContextRecoveryTriggerTokens,
+  resolveAgentMaxOutputTokens
+} from './react-llm-duty/agent-context-budget'
+import { AgentHistoryManager } from './react-llm-duty/agent-history-manager'
+import { AgentResponseTraceCollector } from './react-llm-duty/agent-response-trace-collector'
+import { AgentSessionState } from './react-llm-duty/agent-session-state'
+import {
+  AGENT_IMAGE_INSPECTION_SCHEMA,
+  hidePendingImagePreviews
+} from './react-llm-duty/agent-image-batches'
+
+const TRUNCATED_COMPLETION_FINISH_REASONS = new Set([
+  'length',
+  'max_tokens',
+  'max_output_tokens',
+  'incomplete'
+])
+
+function emitAgentSkillActivityToWebApp(
+  agentSkillContext: AgentSkillContext
+): void {
+  const skillGroupId =
+    `agent_skill_${agentSkillContext.id}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+
+  SOCKET_SERVER.emitAnswerToChatClients({
+    answer: `Using Agent Skill: ${agentSkillContext.name}\nFollowing: ${agentSkillContext.skillPath}`,
+    isToolOutput: true,
+    toolDisplayMode: 'activity_card',
+    activityType: 'agent_skill',
+    status: 'selected',
+    toolGroupId: skillGroupId,
+    key: `agent_skill.${agentSkillContext.id}.selected`,
+    agentSkill: {
+      id: agentSkillContext.id,
+      name: agentSkillContext.name,
+      description: agentSkillContext.description,
+      rootPath: agentSkillContext.rootPath,
+      skillPath: agentSkillContext.skillPath
+    }
+  })
+}
+
+export class ReActLLMDuty extends LLMDuty {
+  private static instance: ReActLLMDuty
+  private static readonly sessionState = new AgentSessionState()
+  private static readonly historyManager = new AgentHistoryManager(
+    'Agent LLM Duty',
+    ReActLLMDuty.sessionState
+  )
+  protected systemPrompt: LLMDutyParams['systemPrompt'] = null
+  protected readonly name = 'Agent LLM Duty'
+  protected input: LLMDutyParams['input'] = null
+  private completionCount = 0
+  private continuationSummaryFailed = false
+  private automaticCompactionFailed = false
+  private totalInputTokens = 0
+  private contextUsage: ContextUsageMetrics | undefined
+  private usageAccounting: UsageAccounting | undefined
+  private totalOutputTokens = 0
+  private totalVisibleOutputTokens = 0
+  private totalOutputChars = 0
+  private totalGenerationDurationMs = 0
+  private phaseMetrics: RawPhaseMetrics = {
+    agent: { outputTokens: 0, durationMs: 0 },
+    final_answer: { outputTokens: 0, durationMs: 0 }
+  }
+  private finalAnswerMetrics: FinalAnswerMetricsSnapshot | null = null
+  private reviewCount = 0
+  private reviewRetryCount = 0
+  private reviewDurationMs = 0
+
+  private executionStartedAt = 0
+  private firstOutputAt: number | null = null
+  private readonly streamedToolCalls = new Map<string, {
+    callable: AgentCallableFunction
+    groupId: string
+    input: string
+  }>()
+  private hasExplicitMemoryWrite = false
+  private hasOwnerMessages = false
+  private hasFinalizedAnswer = false
+  private readonly answerStream = new AgentAnswerStream((payload) => {
+    if (payload.token) {
+      this.firstOutputAt ??= Date.now()
+    }
+    SOCKET_SERVER.emitToChatClients('llm-token', payload)
+  })
+  private finalResponseIntent: FinalResponseSignal['intent'] = 'answer'
+  private lastExecutionHistory: ExecutionRecord[] = []
+  private readonly responseTraceCollector = new AgentResponseTraceCollector()
+  private traceSaveTimer: ReturnType<typeof setTimeout> | null = null
+  private persistResponseTrace: (() => Promise<void>) | null = null
+  private activeAgentSkillContext: AgentSkillContext | null
+  private activeForcedToolName: string | null
+  private allowDirectAnswerHandoff: boolean
+  private readonly additionalInstructions: string
+  private readonly signal: AbortSignal | undefined
+  private readonly deadlineAt: number | undefined
+  private runBudget: AgentRunBudget | undefined
+  private getOwnerMessageSignal: (() => AbortSignal) | undefined
+  private agentTurnSignal: AbortSignal | undefined
+  private readonly files: ReactLLMDutyParams['files']
+  private readonly onProgressEvent:
+    ((event: AgentRunProgressEvent) => void) | undefined
+
+  constructor(params: ReactLLMDutyParams) {
+    super()
+
+    if (!ReActLLMDuty.instance) {
+      LogHelper.title(this.name)
+      LogHelper.success('New instance')
+
+      ReActLLMDuty.instance = this
+    }
+
+    this.input = params.input
+    this.files = params.files
+    this.signal = params.signal
+    this.deadlineAt = params.deadlineAt
+    this.activeAgentSkillContext = params.agentSkill || null
+    this.activeForcedToolName = params.forcedToolName || null
+    this.allowDirectAnswerHandoff = params.allowDirectAnswerHandoff === true
+    this.additionalInstructions = params.additionalInstructions?.trim() || ''
+    this.onProgressEvent = params.onProgressEvent
+    this.systemPrompt = this.appendAdditionalInstructions(
+      PERSONA.getCompactDutySystemPrompt(AGENT_SYSTEM_PROMPT, {
+        includePersonality: false,
+        includeMood: false,
+        includeRuntimeContext: false,
+        cacheFriendly: true
+      })
+    )
+  }
+
+  public async init(
+    params: LLMDutyInitParams = DEFAULT_INIT_PARAMS
+  ): Promise<void> {
+    this.signal?.throwIfAborted()
+    if (!TOOLKIT_REGISTRY.isLoaded) {
+      await TOOLKIT_REGISTRY.load()
+    }
+
+    if (!CONTEXT_MANAGER.isLoaded || params.force) {
+      await CONTEXT_MANAGER.load()
+    }
+  }
+
+  public async execute(): Promise<LLMDutyResult | null> {
+    this.signal?.throwIfAborted()
+    LogHelper.title(this.name)
+    LogHelper.info('Executing...')
+
+    this.executionStartedAt = Date.now()
+    const executionTimeoutSeconds = CONFIG_MANAGER.getConfig().runtime.agent_execution_timeout_seconds
+    this.runBudget = new AgentRunBudget(
+      this.deadlineAt ?? (executionTimeoutSeconds === undefined
+        ? undefined
+        : this.executionStartedAt + executionTimeoutSeconds * 1_000)
+    )
+    this.firstOutputAt = null
+    this.completionCount = 0
+    this.continuationSummaryFailed = false
+    this.automaticCompactionFailed = false
+    this.totalInputTokens = 0
+    this.contextUsage = undefined
+    this.usageAccounting = undefined
+    this.totalOutputTokens = 0
+    this.totalVisibleOutputTokens = 0
+    this.totalOutputChars = 0
+    this.totalGenerationDurationMs = 0
+    this.phaseMetrics = {
+      agent: { outputTokens: 0, durationMs: 0 },
+      final_answer: { outputTokens: 0, durationMs: 0 }
+    }
+    this.finalAnswerMetrics = null
+    this.reviewCount = 0
+    this.reviewRetryCount = 0
+    this.reviewDurationMs = 0
+    this.hasExplicitMemoryWrite = false
+    this.hasOwnerMessages = false
+    this.hasFinalizedAnswer = false
+    this.finalResponseIntent = 'answer'
+    this.lastExecutionHistory = []
+    const traceId = randomUUID()
+    this.responseTraceCollector.reset(traceId)
+    // Capture the session and profile-bound writer before any deferred saves.
+    const sessionId = CONVERSATION_SESSION_MANAGER.getCurrentSessionId()
+    const upsert = CONVERSATION_LOGGER.upsert
+    this.persistResponseTrace = (): Promise<void> => upsert({
+      who: 'leon',
+      message: '',
+      messageId: traceId,
+      isAddedToHistory: false,
+      agentResponseTrace: this.responseTraceCollector.snapshot({})
+    }, { sessionId })
+    this.reportProgressEvent({
+      type: 'reasoning_summary',
+      summary: 'Understanding your request'
+    })
+
+    // Background duties without a bound conversation must not consume messages
+    // addressed to the profile's currently selected chat session.
+    const activeSessionId = getActiveConversationSessionId()
+    const agentTurn = activeSessionId
+      ? CONVERSATION_SESSION_MANAGER.openAgentTurn(activeSessionId)
+      : null
+    this.getOwnerMessageSignal = agentTurn?.getOwnerMessageSignal
+    this.agentTurnSignal = agentTurn?.signal
+
+    try {
+      const ownerInput = this.getInputAsText(this.input)
+      const { messageLogs: history, conversationState } =
+        await ReActLLMDuty.historyManager.loadPreparedHistory(ownerInput)
+      const continuation = this.consumeAgentLoopContinuation()
+      const loadedState = continuation ?? conversationState
+      const originalInput = continuation?.originalInput || ownerInput
+      const planWidgetIdValue =
+        continuation?.planWidgetId || widgetId('plan')
+      let trackedSteps =
+        continuation?.trackedSteps.map((step) => ({ ...step })) || []
+      let hasPlanningWidget = trackedSteps.length > 0
+      const executionHistory: ExecutionRecord[] = []
+      let emittedAgentSkillActivityId: string | null = null
+      const caller = this.createLLMCaller()
+      if (continuation?.activeSkillId) {
+        const skill = await SkillDomainHelper.getAgentSkillExecutionContext(
+          continuation.activeSkillId
+        )
+        if (!skill) {
+          throw new Error('The active Agent Skill is no longer available.')
+        }
+        caller.setAgentSkillContext(skill)
+      }
+      const emitActiveAgentSkillActivity = (): void => {
+        const activeAgentSkillContext = caller.agentSkillContext
+
+        if (
+          !activeAgentSkillContext ||
+          emittedAgentSkillActivityId === activeAgentSkillContext.id
+        ) {
+          return
+        }
+
+        emitAgentSkillActivityToWebApp(activeAgentSkillContext)
+        emittedAgentSkillActivityId = activeAgentSkillContext.id
+      }
+      const finalize = (
+        answer: string,
+        intent: FinalResponseSignal['intent']
+      ): LLMDutyResult => {
+        this.hasFinalizedAnswer = true
+        this.finalResponseIntent = intent
+        this.lastExecutionHistory = executionHistory.map((item) => ({
+          ...item
+        }))
+
+        const dutyResult = this.makeDutyResult(answer)
+        POST_TURN_MAINTENANCE_QUEUE.enqueueIfNeeded(
+          'agent history compaction',
+          () => ReActLLMDuty.historyManager.prepareHistoryCompactionAfterAnswer(
+            planWidgetIdValue,
+            trackedSteps
+          )
+        )
+
+        return dutyResult
+      }
+
+      const progressiveToolkitLoading =
+        CONFIG_MANAGER.getConfig().runtime.progressive_toolkit_loading
+      const matchedSelection =
+        !continuation &&
+        !conversationState &&
+        !this.activeForcedToolName &&
+        !caller.agentSkillContext &&
+        progressiveToolkitLoading
+          ? findHighConfidenceAgentToolSelection(originalInput)
+          : null
+      let catalog = buildAgentToolCatalog(
+        this.activeForcedToolName,
+        loadedState?.loadedToolkitIds,
+        progressiveToolkitLoading,
+        loadedState?.loadedFunctionNames,
+        loadedState?.loadedToolNames,
+        loadedState?.toolOrder
+          ? {
+              toolOrder: loadedState.toolOrder,
+              planTracking: loadedState.planTracking ?? false
+            }
+          : undefined
+      )
+
+      let preloadedToolkitContext = ''
+      if (matchedSelection) {
+        const { toolkitId: matchedToolkitId, toolIds } = matchedSelection
+        // A tool label selects that tool's contract, never its toolkit siblings.
+        // Oversized selections fall back to ordinary progressive discovery.
+        const selectedFunctions = toolIds?.flatMap((toolId) =>
+          Object.keys(TOOLKIT_REGISTRY.getToolFunctions(matchedToolkitId, toolId) || {})
+            .map((name) => `${matchedToolkitId}.${toolId}.${name}`)
+        )
+        const candidateCatalog = buildAgentToolCatalog(
+          this.activeForcedToolName,
+          [matchedToolkitId],
+          progressiveToolkitLoading,
+          selectedFunctions
+        )
+        const candidateToolkitContext = [
+          `<preloaded_toolkit toolkit_id="${matchedToolkitId}">`,
+          'Use available function schemas directly. Call load_toolkit to discover and select additional functions before constructing calls.',
+          buildToolkitContextSection(caller, matchedToolkitId),
+          '</preloaded_toolkit>'
+        ].join('\n')
+        const cost = evaluateAgentToolkitPreloadCost(
+          catalog,
+          candidateCatalog,
+          candidateToolkitContext,
+          this.estimateTokensFromText.bind(this)
+        )
+
+        if (
+          cost.shouldPreload &&
+          candidateCatalog.functionsByToolName.size > catalog.functionsByToolName.size &&
+          candidateCatalog.loadedToolkitIds.has(matchedToolkitId)
+        ) {
+          catalog = candidateCatalog
+          preloadedToolkitContext = candidateToolkitContext
+          LogHelper.info(
+            `Preloaded high-confidence agent toolkit: ${matchedToolkitId} | added_tokens=${cost.additionalPayloadTokens} | routing_budget=${cost.normalRoutingPayloadTokens}`
+          )
+        } else {
+          LogHelper.info(
+            `Skipped high-confidence agent toolkit preload: ${matchedToolkitId} | added_tokens=${cost.additionalPayloadTokens} | routing_budget=${cost.normalRoutingPayloadTokens}`
+          )
+        }
+      }
+
+      if (catalog.tools.length === 0) {
+        return finalize(
+          `The tool "${this.activeForcedToolName}" is not available.`,
+          'error'
+        )
+      }
+
+      const agentSystemPrompt = this.appendAdditionalInstructions(
+        PERSONA.getCompactDutySystemPrompt(
+          AGENT_SYSTEM_PROMPT,
+          {
+            includePersonality: true,
+            includeMood: true,
+            includeRuntimeContext: false,
+            cacheFriendly: true
+          }
+        )
+      )
+      this.systemPrompt = agentSystemPrompt
+
+      const transcript = continuation
+        ? structuredClone(continuation.transcript)
+        : conversationState
+          ? structuredClone(conversationState.transcript)
+          : buildAgentTranscriptHistory(history, ownerInput)
+
+      if (continuation) {
+        // Refresh setup facts after owner interaction without putting credentials in the transcript.
+        const connectionProviders = continuation.executionHistory.flatMap(
+          (execution) => {
+            const observation = parseToolCallArguments(execution.observation)
+            const providers = observation?.['required_connections']
+
+            return observation?.['connection_required'] === true &&
+              Array.isArray(providers)
+              ? providers.filter(
+                  (provider): provider is string => typeof provider === 'string'
+                )
+              : []
+          }
+        )
+        const connectionContext =
+          connectionProviders.length > 0
+            ? [
+                '<current_connection_context>',
+                JSON.stringify(await getConnectionRequirements(connectionProviders)),
+                '</current_connection_context>'
+              ].join('\n')
+            : ''
+
+        transcript.push({
+          role: 'user',
+          ...(this.files?.length ? { files: this.files } : {}),
+          content: [
+            '<clarification_response>',
+            ownerInput,
+            '</clarification_response>',
+            connectionContext
+          ]
+            .filter(Boolean)
+            .join('\n')
+        })
+      } else {
+        const agentRequest = await this.buildAgentRequest(caller, originalInput)
+        transcript.push({
+          role: 'user',
+          ...(this.files?.length ? { files: this.files } : {}),
+          content: [agentRequest, preloadedToolkitContext]
+            .filter(Boolean)
+            .join('\n\n')
+        })
+      }
+
+      LogHelper.title(this.name)
+      LogHelper.debug(
+        'Using continuous agent loop with ' +
+          catalog.tools.length +
+          ' initial tool schema(s) for provider ' +
+          getLLMProviderName()
+      )
+
+      // Store findings and queued sources together so a restart can resume
+      // inspection without repeating pages that already have validated notes.
+      const saveCheckpoint = (
+        state: Pick<AgentLoopResult, 'transcript' | 'executionHistory' | 'trackedSteps'>,
+        reason: string
+      ): void => {
+        this.saveAgentLoopContinuation(createAgentLoopContinuationState({
+          originalInput,
+          clarificationQuestion: reason,
+          planWidgetId: planWidgetIdValue,
+          ...state,
+          loadedToolkitIds: catalog.loadedToolkitIds,
+          loadedToolNames: catalog.loadedToolNames,
+          loadedFunctionNames: [...catalog.functionsByToolName.values()].map((fn) => fn.qualifiedName),
+          toolOrder: catalog.tools.map((tool) => tool.function.name),
+          planTracking: catalog.planTracking === true,
+          activeSkillId: caller.agentSkillContext?.id ?? null
+        }))
+      }
+
+      const result = await runAgentLoop({
+        ...(agentTurn ? {
+          drainOwnerMessages: agentTurn.drainOwnerMessages,
+          getOwnerMessageSignal: agentTurn.getOwnerMessageSignal
+        } : {}),
+        onOwnerMessagesApplied: () => {
+          this.hasOwnerMessages = true
+          this.answerStream.discard()
+          this.closeStreamedToolCalls()
+        },
+        ...(this.signal ? { signal: this.signal } : {}),
+        runBudget: this.runBudget,
+        transcript,
+        catalog,
+        maxIterations: CONFIG_MANAGER.getConfig().runtime.agent_max_iterations ?? AGENT_MAX_ITERATIONS,
+        finishingIterations: AGENT_FINISHING_ITERATIONS,
+        prepareContinuation: (state) =>
+          this.prepareContinuation(state.transcript, {
+            originalInput,
+            trackedSteps: state.trackedSteps,
+            executionHistory: state.executionHistory,
+            loadedToolkitIds: catalog.loadedToolkitIds,
+            loadedToolNames: catalog.loadedToolNames,
+            loadedFunctionNames: [...catalog.functionsByToolName.values()].map((fn) => fn.qualifiedName),
+            activeSkillId: caller.agentSkillContext?.id ?? null
+          }),
+        ...(continuation
+          ? {
+              initialExecutionHistory: continuation.executionHistory,
+              initialTrackedSteps: continuation.trackedSteps
+            }
+          : {}),
+        allowDirectAnswerHandoff:
+          Boolean(this.activeForcedToolName) || this.allowDirectAnswerHandoff,
+        callModel: async (messages, tools, options, state) => {
+          // Loaded guidance and skills must survive compaction and pauses.
+          const activeSkill = caller.agentSkillContext
+          const progressiveGuidance = Object.fromEntries(
+            catalog.loadedProgressiveGuidance
+          )
+
+          // Reviewers use task constraints and evidence. Current clock and mood
+          // stay outside the reusable prefix for both acting and review calls.
+          const baseSystemPrompt = agentSystemPrompt
+          const remainingMs = this.runBudget?.remainingMs
+          // Keep changing task state after the conversation prefix. Rewriting
+          // the system prompt prevents reuse of the history that follows it.
+          appendAgentRuntimeContext(messages, {
+            persona: options.isCompletionReview
+              ? PERSONA.getContextInfo()
+              : PERSONA.getDutyRuntimeContext({ includeMood: true }),
+            tool_guidance: progressiveGuidance,
+            connection_guidance: buildAgentConnectionGuidance(state.executionHistory),
+            elapsed_ms: options.elapsedMs,
+            remaining_operational_iterations: options.remainingIterations,
+            execution_budget: this.runBudget?.deadlineAt === undefined ? null : {
+              deadline_at: new Date(this.runBudget.deadlineAt).toISOString(),
+              remaining_ms: remainingMs,
+              finishing_reserve_ms: this.runBudget.finishingReserveMs,
+              phase: this.runBudget.isFinishing ? 'finishing' : 'working'
+            },
+            reported_plan: Object.fromEntries(
+              state.trackedSteps.map((step) => [step.label, step])
+            ),
+            planning_guidance: state.trackedSteps.length ? AGENT_PLAN_GUIDANCE : null,
+            plan_reconciliation: options.requiresPlanReconciliation
+              ? 'Reconcile the plan with tool evidence now using update_plan: record verified milestones, the actual active step and unresolved mappings/blockers. Preserve completed work; never infer completion from successful input or invent work for this reminder. If the same step remains active, record why. Ask the owner only for missing information or access.'
+              : null,
+            active_skill: activeSkill
+              ? {
+                  name: activeSkill.name,
+                  path: activeSkill.skillPath,
+                  instructions: activeSkill.instructions
+                }
+              : null
+          })
+
+          return this.callAgentModel(
+            messages,
+            baseSystemPrompt,
+            // Reviews retain the cacheable catalog with calls disabled.
+            // Finalization permits only the supplied clarification/cancel tools.
+            options.isCompletionReview
+              ? catalog.tools
+              : tools,
+            options,
+            {
+              originalInput,
+              trackedSteps: state.trackedSteps,
+              executionHistory: state.executionHistory,
+              loadedToolkitIds: catalog.loadedToolkitIds,
+              loadedToolNames: catalog.loadedToolNames,
+              loadedFunctionNames: [...catalog.functionsByToolName.values()].map((fn) => fn.qualifiedName),
+              activeSkillId: caller.agentSkillContext?.id ?? null
+            },
+            catalog.functionsByToolName
+          )
+        },
+        executeFunction: async (callable, toolInput, toolCallTitle, toolCallId) => {
+          const preview = toolCallId ? this.streamedToolCalls.get(toolCallId) : undefined
+          if (toolCallId) {
+            this.streamedToolCalls.delete(toolCallId)
+          }
+
+          const toolResult = await runToolExecution(
+            callable.toolkitId,
+            callable.toolId,
+            callable.functionName,
+            toolInput,
+            undefined,
+            callable.qualifiedName,
+            toolCallTitle,
+            (event) => {
+              const agentSkill = caller.agentSkillContext
+              this.reportProgressEvent({
+                type: 'tool_call',
+                toolCall: {
+                  ...event,
+                  ...(agentSkill
+                    ? {
+                        skillId: agentSkill.id,
+                        nativeSkillPath: agentSkill.skillPath
+                      }
+                    : {})
+                }
+              })
+            },
+            this.getExecutionSignal(),
+            (message) => this.emitProgress(message),
+            preview?.groupId
+          )
+
+          return toolResult
+        },
+        loadToolkitContext: (toolkitId) =>
+          buildToolkitContextSection(caller, toolkitId),
+        loadAgentSkill:
+          SkillDomainHelper.getAgentSkillExecutionContext.bind(
+            SkillDomainHelper
+          ),
+        onAgentSkillLoaded: (context) => {
+          caller.setAgentSkillContext(context)
+          emitActiveAgentSkillActivity()
+        },
+        onProgressMessage: async (message) => {
+          // Existing hosts display reasoning_summary as a public activity summary.
+          this.reportProgressEvent({ type: 'reasoning_summary', summary: message })
+          await this.emitProgress(message, this.answerStream.finish())
+        },
+        onInspectionCheckpoint: (state) => saveCheckpoint(state, 'Image inspection is in progress.'),
+        onPlanUpdated: (steps) => {
+          trackedSteps = steps.map((step) => ({ ...step }))
+          emitPlanWidget(
+            trackedSteps,
+            null,
+            planWidgetIdValue,
+            hasPlanningWidget
+          )
+          hasPlanningWidget = true
+          for (const [index, step] of trackedSteps.entries()) {
+            this.reportProgressEvent({
+              type: 'plan_step',
+              step: {
+                id: `plan-${index + 1}`,
+                label: step.label,
+                status: step.status
+              }
+            })
+          }
+          const activeStep = trackedSteps.find(
+            (step) => step.status === 'in_progress'
+          )
+          if (activeStep) {
+            this.reportProgressEvent({
+              type: 'reasoning_summary',
+              summary: activeStep.label
+            })
+          }
+        }
+      })
+
+      executionHistory.push(...result.executionHistory)
+      trackedSteps = result.trackedSteps.map((step) => ({ ...step }))
+      if (result.intent === 'cancelled') {
+        agentTurn?.cancelExecutions()
+      }
+
+      this.hasExplicitMemoryWrite = executionHistory.some(
+        (execution) =>
+          execution.status === 'success' &&
+          execution.function === 'structured_knowledge.memory.write'
+      )
+
+      if (result.intent !== 'answer' && result.intent !== 'cancelled') {
+        saveCheckpoint({ transcript: result.transcript, trackedSteps, executionHistory }, result.answer)
+      } else {
+        ReActLLMDuty.sessionState.getContinuationStore().save(null)
+        await ReActLLMDuty.historyManager.saveConversationState(
+          {
+            transcript: retainRecentToolImages(result.transcript),
+            loadedToolkitIds: [...catalog.loadedToolkitIds],
+            loadedToolNames: [...catalog.loadedToolNames],
+            loadedFunctionNames: [...catalog.functionsByToolName.values()].map(
+              (fn) => fn.qualifiedName
+            ),
+            toolOrder: catalog.tools.map((tool) => tool.function.name),
+            planTracking: catalog.planTracking === true
+          },
+          StringHelper.normalizeUserFacingText(result.answer)
+        )
+      }
+
+      this.signal?.throwIfAborted()
+      return finalize(result.answer, result.intent)
+    } catch (error) {
+      this.answerStream.discard()
+      this.responseTraceCollector.interrupt()
+      this.signal?.throwIfAborted()
+      LogHelper.title(this.name)
+      LogHelper.error(`Failed to execute: ${String(error)}`)
+      return null
+    } finally {
+      this.runBudget?.dispose()
+      agentTurn?.close()
+      this.getOwnerMessageSignal = undefined
+      this.agentTurnSignal = undefined
+      this.closeStreamedToolCalls()
+
+      if (this.traceSaveTimer) {
+        clearTimeout(this.traceSaveTimer)
+        this.traceSaveTimer = null
+      }
+      // Drain snapshots before the caller persists the final answer, including aborts.
+      await this.persistResponseTrace?.()
+      this.persistResponseTrace = null
+    }
+  }
+
+  private getInputAsText(input: string | object | null): string {
+    if (typeof input === 'string') {
+      return input
+    }
+
+    if (input === null || input === undefined) {
+      return ''
+    }
+
+    return this.safeJSONStringify(input)
+  }
+
+  /**
+   * Shares owner interruptions and the run deadline with every in-flight operation.
+   */
+  private getExecutionSignal(): AbortSignal | undefined {
+    const signals = [this.signal, this.agentTurnSignal, this.getOwnerMessageSignal?.(), this.runBudget?.signal]
+      .filter((signal): signal is AbortSignal => Boolean(signal))
+
+    if (signals.length > 1) {
+      return AbortSignal.any(signals)
+    }
+
+    return signals[0]
+  }
+
+  /**
+   * Records user-visible progress before forwarding it to an optional host.
+   */
+  private reportProgressEvent(event: AgentRunProgressEvent): void {
+    // Argument previews can end before dispatch.
+    // Give those traces the same registry labels as executed calls.
+    if (
+      event.type === 'tool_call' &&
+      (!event.toolCall.toolkitName || !event.toolCall.toolName)
+    ) {
+      const [toolkitId, toolId, functionName] = event.toolCall.name.split('.')
+
+      if (toolkitId && toolId && functionName) {
+        const display = getToolDisplayContext(toolkitId, toolId, functionName)
+
+        event = {
+          ...event,
+          toolCall: {
+            ...event.toolCall,
+            toolkitName: event.toolCall.toolkitName || display.toolkitName,
+            toolName: event.toolCall.toolName || display.toolName
+          }
+        }
+      }
+    }
+
+    this.responseTraceCollector.record(event)
+    this.scheduleTraceSave()
+    this.onProgressEvent?.(event)
+  }
+
+  /**
+   * Closes previews that were canceled, rejected, or never selected for execution.
+   */
+  private closeStreamedToolCalls(): void {
+    for (const { callable, groupId, input } of this.streamedToolCalls.values()) {
+      const message = 'This proposed tool call was not executed.'
+      this.reportProgressEvent({
+        type: 'tool_call',
+        toolCall: {
+          id: groupId,
+          name: callable.qualifiedName,
+          status: 'error',
+          input,
+          errorMessage: message
+        }
+      })
+      emitToolExecutionOutputToWebApp({
+        ...callable,
+        toolGroupId: groupId,
+        output: {},
+        status: 'error',
+        message
+      })
+    }
+
+    this.streamedToolCalls.clear()
+  }
+
+  private scheduleTraceSave(): void {
+    if (!this.persistResponseTrace || this.traceSaveTimer) {
+      return
+    }
+    // Coalesce streamed tokens instead of rewriting history for every token.
+    this.traceSaveTimer = setTimeout(() => {
+      this.traceSaveTimer = null
+      void this.persistResponseTrace?.()
+    }, TRACE_SAVE_INTERVAL_MS)
+  }
+
+  /**
+   * Appends trusted integration guidance without changing the shared loop.
+   */
+  private appendAdditionalInstructions(systemPrompt: string): string {
+    if (!this.additionalInstructions) {
+      return systemPrompt
+    }
+
+    return [
+      systemPrompt,
+      '',
+      '<additional_instructions>',
+      this.additionalInstructions,
+      '</additional_instructions>'
+    ].join('\n')
+  }
+
+  /**
+   * Adds stable turn-level grounding to the first user message. Subsequent
+   * agent calls reuse this message and append tool protocol messages only.
+   */
+  private async buildAgentRequest(
+    caller: LLMCaller,
+    input: string
+  ): Promise<string> {
+    const sections = [
+      '<user_request>',
+      input,
+      '</user_request>',
+      '',
+      '<local_workspace>',
+      `Default local working directory: ${process.cwd()}`,
+      'Resolve relative task paths here unless the owner establishes another workspace. For Satellite, inspect that device\'s working directory first.',
+      '</local_workspace>',
+      '',
+      '<context_manifest>',
+      'Context filenames are identifiers, not workspace paths. Read them with structured_knowledge.context.readContextFile.',
+      caller.getContextManifest(),
+      '</context_manifest>',
+      '',
+      '<self_model>',
+      caller.getSelfModelSnapshot(),
+      '</self_model>'
+    ]
+
+    if (caller.agentSkillCatalog.trim()) {
+      sections.push(
+        '',
+        '<available_agent_skills>',
+        caller.agentSkillCatalog,
+        '</available_agent_skills>'
+      )
+    }
+
+    if (caller.agentSkillContext) {
+      sections.push(
+        '',
+        '<active_agent_skill>',
+        `Name: ${caller.agentSkillContext.name}`,
+        `Path: ${caller.agentSkillContext.skillPath}`,
+        '',
+        caller.agentSkillContext.instructions,
+        '</active_agent_skill>'
+      )
+    }
+
+    if (caller.getPreviousToolArtifacts) {
+      try {
+        const previousToolArtifacts =
+          await caller.getPreviousToolArtifacts()
+        if (previousToolArtifacts.trim()) {
+          sections.push(
+            '',
+            '<previous_tool_artifacts>',
+            'These artifacts come from earlier turns, not the current agent transcript.',
+            previousToolArtifacts,
+            '</previous_tool_artifacts>'
+          )
+        }
+      } catch (error) {
+        LogHelper.title(this.name)
+        LogHelper.warning(
+          `Failed to load previous tool artifacts: ${String(error)}`
+        )
+      }
+    }
+
+    return sections.join('\n')
+  }
+
+  private loadValidAgentLoopContinuation(): AgentLoopContinuationState | null {
+    const stateStore = ReActLLMDuty.sessionState.getContinuationStore()
+    const state = stateStore.load()
+    if (!state) {
+      return null
+    }
+
+    if (!isAgentLoopContinuationStateValid(state)) {
+      stateStore.save(null)
+      return null
+    }
+
+    return state
+  }
+
+  private saveAgentLoopContinuation(state: AgentLoopContinuationState): void {
+    ReActLLMDuty.sessionState.getContinuationStore().save(state)
+  }
+
+  private consumeAgentLoopContinuation(): AgentLoopContinuationState | null {
+    const state = this.loadValidAgentLoopContinuation()
+    if (!state) {
+      return null
+    }
+
+    ReActLLMDuty.sessionState.getContinuationStore().save(null)
+    return state
+  }
+
+  // ---------------------------------------------------------------------------
+  // LLM calling helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Provides the stable context and skill callbacks used by the agent loop.
+   */
+  private createLLMCaller(): LLMCaller {
+    const getActiveAgentSkillContext = (): AgentSkillContext | null =>
+      this.activeAgentSkillContext
+    const setActiveAgentSkillContext = (context: AgentSkillContext): void => {
+      this.activeAgentSkillContext = context
+    }
+
+    return {
+      get agentSkillContext(): AgentSkillContext | null {
+        return getActiveAgentSkillContext()
+      },
+      agentSkillCatalog: SkillDomainHelper.getAgentSkillCatalogContentSync(),
+      setAgentSkillContext: setActiveAgentSkillContext,
+      getContextFileContent: CONTEXT_MANAGER.getContextFileContent.bind(
+        CONTEXT_MANAGER
+      ),
+      getContextManifest: CONTEXT_MANAGER.getManifest.bind(CONTEXT_MANAGER),
+      getSelfModelSnapshot:
+        SELF_MODEL_MANAGER.getSnapshot.bind(SELF_MODEL_MANAGER),
+      getPreviousToolArtifacts:
+        TOOL_CALL_LOGGER.getRecentArtifactManifest.bind(TOOL_CALL_LOGGER)
+    }
+  }
+
+  /**
+   * Preserves native context on pause or summarizes portable context on recovery.
+   */
+  private async prepareContinuation(
+    transcript: AgentToolTranscriptMessage[],
+    checkpointInput?: AgentContinuityCheckpointInput,
+    restoreSourceEvidence = false
+  ): Promise<AgentToolTranscriptMessage[]> {
+    this.signal?.throwIfAborted()
+    if (restoreSourceEvidence) {
+      // Context recovery needs source evidence instead of opaque provider state.
+      transcript = restoreCompactionSources(transcript)
+    }
+
+    return buildAgentContinuationTranscript(transcript, async (history) => {
+      // A failed summary must not cause an auxiliary retry on every tool turn.
+      if (this.continuationSummaryFailed || this.runBudget?.isFinishing) return null
+      const startedAt = Date.now()
+      try {
+        const cancellationSignal = this.getExecutionSignal()
+        const result = await LLM_PROVIDER.prompt(history, {
+          ...(cancellationSignal ? { cancellationSignal } : {}),
+          dutyType: LLMDuties.ReAct,
+          systemPrompt: AGENT_CONTINUATION_SUMMARY_SYSTEM_PROMPT,
+          usagePurpose: InferencePurpose.ContextCompaction,
+          temperature: 0,
+          maxTokens: AGENT_CONTINUATION_SUMMARY_MAX_TOKENS,
+          timeout: this.runBudget?.capTimeout(AGENT_CONTINUATION_SUMMARY_TIMEOUT_MS) ?? AGENT_CONTINUATION_SUMMARY_TIMEOUT_MS,
+          maxRetries: 0,
+          remoteProviderErrorRetries: 0,
+          shouldStream: false,
+          disableThinking: true,
+          trackProviderErrors: false,
+          disableContextCompaction: true
+        })
+        this.signal?.throwIfAborted()
+        if (result) {
+          this.observeCompletionMetrics({
+            phase: 'agent',
+            completionStartedAt: startedAt,
+            completedAt: Date.now(),
+            ...result
+          })
+        }
+        const summary = typeof result?.output === 'string' ? result.output.trim() : ''
+        if (!summary || TRUNCATED_COMPLETION_FINISH_REASONS.has(
+          String(result?.finishReason ?? '')
+        )) {
+          throw new Error('Summary was empty or incomplete')
+        }
+        LogHelper.info(
+          `Agent continuation summary completed in ${Date.now() - startedAt}ms`
+        )
+        return summary
+      } catch {
+        this.signal?.throwIfAborted()
+        this.continuationSummaryFailed = true
+        LogHelper.warning('Agent continuation summary unavailable; retaining original context')
+        return null
+      }
+    }, checkpointInput)
+  }
+
+  private async callAgentModel(
+    transcript: AgentToolTranscriptMessage[],
+    systemPrompt: string,
+    tools: OpenAITool[],
+    options: {
+      isRecoveryAttempt: boolean
+      isOutputRecoveryAttempt?: boolean
+      isFinalizationAttempt?: boolean
+      isCompletionReview?: boolean
+      isCompletionReviewRetry?: boolean
+      completionReviewIntent?: 'answer' | 'clarification'
+      isContextRecoveryAttempt?: boolean
+      isImageInspection?: boolean
+      hasPendingImages?: boolean
+    },
+    checkpointInput?: AgentContinuityCheckpointInput,
+    functionsByToolName?: ReadonlyMap<string, AgentCallableFunction>
+  ): Promise<{
+    toolCalls?: OpenAIToolCall[]
+    textContent?: string
+    reasoning?: string
+    reasoningItems?: ProviderReasoningItem[]
+    compactionContext?: ProviderCompactionContext
+    providerMessage?: ProviderMessageMetadata
+    isTruncated?: boolean
+  } | null> {
+    this.runBudget?.throwIfExpired()
+    const executionSignal = this.getExecutionSignal()
+    executionSignal?.throwIfAborted()
+    if (options.isContextRecoveryAttempt) {
+      // An opaque window can itself exceed the wire budget. Rebuild from its
+      // saved sources rather than carrying the same window into recovery.
+      const sources = restoreCompactionSources(transcript, null)
+      transcript.splice(0, transcript.length, ...sources)
+    }
+    if (transcript.some((message) =>
+      message.role === 'assistant' && message.compactionContext
+    )) {
+      const targetTranscript = await LLM_PROVIDER.prepareAgentTranscript(transcript)
+      this.signal?.throwIfAborted()
+      transcript.splice(0, transcript.length, ...targetTranscript)
+    }
+
+    if (!options.isImageInspection) {
+      const projected = hidePendingImagePreviews(transcript)
+      if (projected.some((message, index) => message !== transcript[index])) {
+        options = { ...options, hasPendingImages: true }
+        transcript = projected
+        appendAgentRuntimeContext(transcript, {
+          pending_image_inspection: 'Queued previews have not yet been inspected. Preserve their pending scope and source references; do not claim visual coverage or completion. Resume their inspection when the execution budget allows.'
+        })
+      }
+    }
+
+    const phase: AgentPhase = options.isFinalizationAttempt
+      ? 'final_answer'
+      : 'agent'
+    const isPrivateResponse = options.isCompletionReview || options.isImageInspection
+    const activeSystemPrompt = [
+      systemPrompt,
+      ...(options.isFinalizationAttempt
+        ? [AGENT_LIMIT_FINALIZATION_SYSTEM_PROMPT]
+        : [])
+    ].join('\n\n')
+    const providerName = getLLMProviderName()
+    if (providerName === LLMProviders.OpenAI && options.isContextRecoveryAttempt) {
+      this.automaticCompactionFailed = true
+    }
+    const providerManagesContext = providerName === LLMProviders.OpenAI &&
+      !this.automaticCompactionFailed && !options.hasPendingImages
+    const contextCompactionTriggerTokens = options.isContextRecoveryAttempt
+      ? resolveAgentContextRecoveryTriggerTokens(providerName)
+      : resolveAgentContextCompactionTriggerTokens(providerName)
+    let preparedContext = prepareAgentModelContext({
+      transcript,
+      systemPrompt: activeSystemPrompt,
+      tools,
+      // Reviews need the complete capability contract even when text compacts.
+      preserveToolSchemas: options.isCompletionReview === true,
+      // OpenAI measures actual request tokens and triggers compaction itself.
+      compactionTriggerTokens: providerManagesContext
+        ? Number.POSITIVE_INFINITY
+        : contextCompactionTriggerTokens,
+      forceCompaction:
+        options.isRecoveryAttempt || Boolean(options.isFinalizationAttempt)
+    })
+    if (
+      !providerManagesContext &&
+      preparedContext.estimatedInputTokens > contextCompactionTriggerTokens
+    ) {
+      const summarized = await this.prepareContinuation(
+        transcript,
+        checkpointInput,
+        true
+      )
+      if (summarized !== transcript) {
+        transcript.splice(0, transcript.length, ...summarized)
+        preparedContext = prepareAgentModelContext({
+          transcript,
+          systemPrompt: activeSystemPrompt,
+          tools,
+          preserveToolSchemas: options.isCompletionReview === true,
+          compactionTriggerTokens: contextCompactionTriggerTokens
+        })
+      }
+    }
+    if (
+      !providerManagesContext &&
+      preparedContext.estimatedInputTokens > contextCompactionTriggerTokens
+    ) {
+      throw new AgentModelProviderError(
+        `Agent context remains above its ${contextCompactionTriggerTokens}-token target after compaction.`,
+        !options.isContextRecoveryAttempt,
+        CompletionFailureKind.Context
+      )
+    }
+    const preparedTranscript = preparedContext.transcript
+    const preparedTools = preparedContext.tools
+    const toolChoice = isPrivateResponse
+      ? 'none'
+      : 'auto'
+    const promptForLog = this.safeJSONStringify(preparedTranscript)
+    const completionStartedAt = Date.now()
+    const inferencePolicy = getAgentInferencePolicy()
+    const agentTarget = CONFIG_STATE.getModelState().getAgentTarget()
+    const modelSettings = CONFIG_STATE
+      .getModelSettingsState()
+      .getSettings(agentTarget)
+    const modelCapabilities = getLLMModelCatalogEntry(
+      agentTarget.provider,
+      agentTarget.model
+    )
+    const internalReasoningEffort = options.isImageInspection
+      ? IMAGE_INSPECTION_REASONING_EFFORT
+      : options.completionReviewIntent === 'clarification'
+        ? CLARIFICATION_REVIEW_REASONING_EFFORT
+        : COMPLETION_REVIEW_REASONING_EFFORT
+    // Apply each phase's effort only when the active model supports it.
+    // Otherwise, retain its normal provider-compatible settings.
+    const useInternalReasoning = isPrivateResponse &&
+      modelCapabilities?.reasoning.includes(internalReasoningEffort)
+    const configuredReasoning = useInternalReasoning
+      ? internalReasoningEffort
+      : modelSettings.reasoning
+    const defaultReasoning = getLLMModelDefaultReasoning(agentTarget.provider, agentTarget.model)
+    const reasoningEffortBaseline = useInternalReasoning &&
+      modelCapabilities?.supportsPerMessageReasoning &&
+      modelSettings.reasoning !== 'none'
+      ? modelSettings.reasoning === 'auto'
+        ? defaultReasoning.effort
+        : modelSettings.reasoning
+      : undefined
+    // Claude's response schema changes its cached system prefix. Keep the
+    // first review cacheable, using constrained JSON only to recover a retry.
+    const responseSchema = options.isImageInspection && modelCapabilities?.supportsStructuredOutput
+      ? AGENT_IMAGE_INSPECTION_SCHEMA
+      : options.isCompletionReview &&
+      modelCapabilities?.supportsStructuredOutput &&
+      (providerName !== LLMProviders.Anthropic || options.isCompletionReviewRetry)
+      ? AGENT_COMPLETION_REVIEW_SCHEMA
+      : undefined
+    // Finalization is still a model request. Keep its configured reasoning:
+    // providers with mandatory reasoning reject a forced reasoning-off retry.
+    const reasoningMode =
+      configuredReasoning === 'auto'
+        ? inferencePolicy.reasoningMode
+        : configuredReasoning === 'none'
+          ? 'off'
+          : 'on'
+    let reasoningEffort =
+      configuredReasoning === 'auto'
+        ? defaultReasoning.effort
+        : configuredReasoning === 'on' ? undefined : configuredReasoning
+    let reasoningEffortSource: AgentInferencePolicy['reasoningEffortSource'] = useInternalReasoning
+      ? options.isImageInspection ? 'inspection' : 'review'
+      : configuredReasoning === 'auto' ? defaultReasoning.source : 'owner'
+    // Auto may recover from reasoning-only exhaustion with less effort.
+    // Never disable mandatory reasoning or override an explicit owner choice.
+    if (options.isOutputRecoveryAttempt && configuredReasoning === 'auto' &&
+      reasoningMode === 'on' && getLLMModelCatalogEntry(
+        providerName, agentTarget.model
+      )?.reasoning.includes('low')) {
+      reasoningEffort = 'low'
+      reasoningEffortSource = 'recovery'
+    }
+    const reasoningUseDefaultEffort = configuredReasoning === 'on'
+    const serviceTier = modelSettings.speed === 'fast'
+      ? 'priority'
+      : modelSettings.speed === 'normal'
+        ? 'default'
+        : undefined
+    const disableThinking = reasoningMode === 'off'
+    const maxOutputTokens = resolveAgentMaxOutputTokens(
+      providerName,
+      preparedContext.estimatedInputTokens
+    )
+    if (options.isOutputRecoveryAttempt) {
+      LogHelper.info(
+        `Retrying truncated agent output with max_tokens=${maxOutputTokens ?? 'provider default'}; reasoning effort=${reasoningEffort ?? 'provider default'}`
+      )
+    }
+    const shouldEmitReasoning =
+      !isPrivateResponse && reasoningMode !== 'off' && inferencePolicy.emitReasoning
+
+    const toolNames = preparedTools.map((t) => t.function.name).join(', ')
+    // Each model call starts a new block; its streamed chunks share this ID.
+    const reasoningGenerationId = shouldEmitReasoning
+      ? randomUUID()
+      : null
+
+    this.logTitle(phase)
+    LogHelper.debug(`callAgentModel: tools=[${toolNames}] | choice=${toolChoice}`)
+    if (preparedContext.wasCompacted) {
+      LogHelper.debug(
+        `callAgentModel: bounded context prepared | est_tokens=${preparedContext.estimatedInputTokensBeforePreparation}->${preparedContext.estimatedInputTokens} | tools=${tools.length}->${preparedTools.length} | recovery=${options.isRecoveryAttempt} | finalization=${Boolean(options.isFinalizationAttempt)}`
+      )
+    }
+    this.logAgentPromptDispatch({
+      estimatedInputTokens: preparedContext.estimatedInputTokens,
+      prompt: promptForLog,
+      systemPrompt: activeSystemPrompt,
+      tools: preparedTools,
+      toolChoice,
+      phasePolicySummary: formatAgentInferencePolicyForLog({
+        ...inferencePolicy,
+        reasoningMode,
+        reasoningEffortSource,
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+        ...(serviceTier ? { serviceTier } : {}),
+        emitReasoning: shouldEmitReasoning
+      }),
+      shouldStream: inferencePolicy.streamToProvider
+    })
+
+    let completionResult: Awaited<ReturnType<typeof LLM_PROVIDER.prompt>>
+    let completed = false
+    let waitNoticeTimer: NodeJS.Timeout | null = null
+    let diagnosisTimer: NodeJS.Timeout | null = null
+    const toolCallAbortController = new AbortController()
+
+    const modelResponseStartedAt = Date.now()
+    const modelResponseMaximumDeadlineAt = modelResponseStartedAt +
+      (this.runBudget?.capTimeout(AGENT_MODEL_RESPONSE_MAX_DURATION_MS) ?? AGENT_MODEL_RESPONSE_MAX_DURATION_MS)
+    const contextWindowTokens = resolveModelContextWindowTokens(
+      agentTarget.provider,
+      agentTarget.model
+    )
+    // Only the active transcript describes context occupancy; auxiliary summaries
+    // still contribute to turn accounting without replacing this snapshot.
+    this.contextUsage = captureContextUsage({
+      estimatedInputTokens: preparedContext.estimatedInputTokens,
+      contextWindowTokens
+    })
+    const initialResponseDeadlineAt = Math.min(
+      modelResponseMaximumDeadlineAt,
+      modelResponseStartedAt + AGENT_MODEL_RESPONSE_TIMEOUT_MS
+    )
+    const modelStatus: ModelResponseStatus = {
+      contextUsage: this.contextUsage,
+      requestId: randomUUID(),
+      sessionId: CONVERSATION_SESSION_MANAGER.getCurrentSessionId(),
+      startedAt: modelResponseStartedAt,
+      state: ModelResponseState.Waiting,
+      attempt: 1,
+      deadlineAt: initialResponseDeadlineAt
+    }
+    let modelAttempt = 0
+    let lastModelProgressAt = modelResponseStartedAt
+    let lastAttemptFailureKind: CompletionFailureKind | undefined
+    let lastAttemptDiagnostics: ProviderActivitySnapshot | undefined
+    let lastActivityUpdateAt = 0
+    const responseAbortController = new AbortController()
+    const cancellationSignal = AbortSignal.any([
+      responseAbortController.signal,
+      ...(executionSignal ? [executionSignal] : [])
+    ])
+    // Retries share cancellation and the hard cap, but each gets a usable wait.
+    const abortModelResponse = (): void => {
+      responseAbortController.abort(new AgentModelResponseTimeoutError())
+    }
+    let responseDeadlineTimer = setTimeout(abortModelResponse, Math.max(0, initialResponseDeadlineAt - Date.now()))
+    const refreshWaitDiagnostics = (): void => {
+      lastModelProgressAt = Date.now()
+      waitNoticeTimer?.refresh()
+      diagnosisTimer?.refresh()
+    }
+    const renewModelResponseDeadline = (
+      timeout = AGENT_MODEL_RESPONSE_TIMEOUT_MS
+    ): void => {
+      if (cancellationSignal.aborted) {
+        return
+      }
+
+      refreshWaitDiagnostics()
+      modelStatus.deadlineAt = Math.min(
+        modelResponseMaximumDeadlineAt,
+        Date.now() + Math.max(AGENT_MODEL_RESPONSE_TIMEOUT_MS, timeout)
+      )
+      clearTimeout(responseDeadlineTimer)
+      responseDeadlineTimer = setTimeout(
+        abortModelResponse,
+        Math.max(0, modelStatus.deadlineAt - Date.now())
+      )
+    }
+    // Abort signals may be delivered from another request's context.
+    const emitModelStatus = AsyncResource.bind((
+      state: ModelResponseState
+    ): void => {
+      if (cancellationSignal.aborted && state !== ModelResponseState.Completed) {
+        return
+      }
+
+      modelStatus.state = options.isCompletionReview && state !== ModelResponseState.Completed
+        ? ModelResponseState.Reviewing
+        : state
+      SOCKET_SERVER.emitToChatClients('model-response-status', { ...modelStatus }, {
+        sessionId: modelStatus.sessionId
+      })
+    })
+    const clearModelStatus = (): void => {
+      if (modelStatus.state !== ModelResponseState.Completed) {
+        emitModelStatus(ModelResponseState.Completed)
+      }
+    }
+    executionSignal?.addEventListener('abort', clearModelStatus, { once: true })
+    emitModelStatus(ModelResponseState.Waiting)
+
+    const clearWaitDiagnostics = (): void => {
+      if (waitNoticeTimer) {
+        clearTimeout(waitNoticeTimer)
+        waitNoticeTimer = null
+      }
+      if (diagnosisTimer) {
+        clearTimeout(diagnosisTimer)
+        diagnosisTimer = null
+      }
+    }
+    const startWaitDiagnostics = (): void => {
+      clearWaitDiagnostics()
+      lastModelProgressAt = Date.now()
+
+      // Heartbeats keep transport alive but must not hide missing model output.
+      waitNoticeTimer = setTimeout(() => {
+        if (completed || cancellationSignal.aborted) {
+          return
+        }
+
+        this.logTitle(phase)
+        LogHelper.warning(
+          `callAgentModel: no model progress for ${Date.now() - lastModelProgressAt}ms`
+        )
+      }, AGENT_TOOL_CALL_WAIT_NOTICE_DELAY_MS)
+
+      diagnosisTimer = setTimeout(() => {
+        if (completed || cancellationSignal.aborted) {
+          return
+        }
+
+        this.logLongToolCallDiagnosis(
+          preparedContext.estimatedInputTokens,
+          preparedTools,
+          phase,
+          toolChoice
+        )
+      }, AGENT_TOOL_CALL_DIAGNOSIS_DELAY_MS)
+    }
+
+    startWaitDiagnostics()
+
+    const isFinishingCall = options.isCompletionReview ||
+      options.isFinalizationAttempt || this.runBudget?.isFinishing
+    const remainingMs = this.runBudget?.remainingMs
+    // Operational reasoning gets the same initial wait advertised by the loop.
+    const inferenceLimit = isPrivateResponse
+      ? AGENT_INFERENCE_TIMEOUT_MS
+      : AGENT_MODEL_RESPONSE_TIMEOUT_MS
+    const inferenceTimeout = remainingMs === undefined
+      ? inferenceLimit
+      : Math.min(
+          inferenceLimit,
+          isFinishingCall ? remainingMs : remainingMs / 2
+        )
+
+    try {
+      // Reviews must neither expose their text nor replace the proposed answer.
+      // A subsequent operational call removes any ending rejected by review.
+      if (!isPrivateResponse) {
+        this.answerStream.discard()
+      } else if (options.isCompletionReviewRetry) {
+        this.reviewRetryCount += 1
+      } else if (options.isCompletionReview) {
+        this.reviewCount += 1
+      }
+      completionResult = await LLM_PROVIDER.prompt(preparedTranscript, {
+        dutyType: LLMDuties.ReAct,
+        ...(options.isImageInspection ? { usagePurpose: InferencePurpose.ImageInspection } : {}),
+        systemPrompt: activeSystemPrompt,
+        ...(responseSchema ? { data: responseSchema } : {}),
+        temperature: AGENT_TEMPERATURE,
+        // Operational calls leave time for recovery. Finishing and review use
+        // the reserved time rather than repeatedly halving the final wait.
+        // Productive output still stays within the fixed run deadline.
+        timeout: this.runBudget?.capTimeout(inferenceTimeout) ?? inferenceTimeout,
+        // Keep provider compatibility retries before the finishing reserve;
+        // the shared cancellation signal still caps the entire request.
+        maxRetries: this.runBudget?.isFinishing ? 0 : AGENT_TIMEOUT_MAX_RETRIES,
+        getRetryTimeout: (timeoutMs): number => {
+          const remaining = this.runBudget?.remainingMs
+
+          return remaining === undefined
+            ? timeoutMs
+            : Math.min(timeoutMs, Math.max(0, remaining - (this.runBudget?.finishingReserveMs ?? 0)))
+        },
+        ...(isFinishingCall ? { remoteProviderErrorRetries: 0, connectionErrorRetries: 0 } : {}),
+        onConnectionRetry: async ({ attempt, maxRetries, delayMs }): Promise<void> => {
+          cancellationSignal.throwIfAborted()
+          clearWaitDiagnostics()
+          renewModelResponseDeadline(inferenceTimeout + delayMs)
+          emitModelStatus(ModelResponseState.Retrying)
+          await this.emitProgress(
+            `Connection to my model provider failed. Retry ${attempt}/${maxRetries} in ${delayMs / 1_000} seconds.`
+          )
+        },
+        maxTokens: maxOutputTokens,
+        shouldStream: inferencePolicy.streamToProvider,
+        onAttempt: (timing): void => {
+          this.responseTraceCollector.recordInference({
+            ...timing,
+            phase: options.isCompletionReview ? 'review' : phase
+          })
+          this.scheduleTraceSave()
+          if (timing.outcome !== 'started') {
+            lastAttemptFailureKind = timing.failureKind
+            lastAttemptDiagnostics = timing.failureSummary ? timing : undefined
+          }
+          if (timing.outcome === 'started') {
+            if (options.isCompletionReview && modelAttempt > 0) {
+              this.reviewRetryCount += 1
+            }
+            startWaitDiagnostics()
+            renewModelResponseDeadline(timing.inferenceTimeoutMs)
+            modelAttempt += 1
+            modelStatus.attempt = modelAttempt
+            modelStatus.lastActivityAt = null
+            emitModelStatus(ModelResponseState.Waiting)
+          } else if (timing.outcome === 'completed') {
+            clearWaitDiagnostics()
+            clearModelStatus()
+          } else {
+            clearWaitDiagnostics()
+            modelStatus.retryReason = timing.failureKind
+            emitModelStatus(ModelResponseState.Retrying)
+          }
+        },
+        onStreamEvent: (event): void => {
+          if (cancellationSignal.aborted || event.type === 'transport-heartbeat') {
+            return
+          }
+
+          if (event.type === 'finish') {
+            // Provider generation is done; local artifact work has its own lifecycle.
+            clearTimeout(responseDeadlineTimer)
+            clearWaitDiagnostics()
+          } else if (
+            event.type === 'tool-input-delta' || event.type === 'tool-call-delta' ||
+            event.type === 'tool-call' || event.type === 'tool-result' ||
+            event.type === 'compaction-start' || event.type === 'compaction-end' ||
+            event.type === 'file'
+          ) {
+            renewModelResponseDeadline()
+          } else if (event.type === 'reasoning-start' || event.type === 'reasoning-end') {
+            refreshWaitDiagnostics()
+          }
+          if (event.type === 'stream-open' && !isPrivateResponse) {
+            // A retry replaces any unfinished previews from its predecessor.
+            this.closeStreamedToolCalls()
+          }
+
+          if (modelStatus.state === ModelResponseState.Completed) {
+            return
+          }
+
+          modelStatus.lastActivityAt = Date.now()
+          if (event.type === 'stream-open' || event.type === 'reasoning-end') {
+            emitModelStatus(ModelResponseState.Connected)
+          } else if (event.type === 'reasoning-start') {
+            emitModelStatus(ModelResponseState.Reasoning)
+          } else if (
+            event.type === 'finish' || (!isPrivateResponse && (
+              event.type === 'tool-input-start' || event.type === 'tool-input-delta' ||
+              event.type === 'tool-call-delta' || event.type === 'tool-call'
+            ))
+          ) {
+            clearModelStatus()
+          } else if (Date.now() - lastActivityUpdateAt >= MODEL_ACTIVITY_UPDATE_INTERVAL_MS) {
+            lastActivityUpdateAt = Date.now()
+            emitModelStatus(modelStatus.state)
+          }
+        },
+        onToken: (token: unknown): void => {
+          if (cancellationSignal.aborted || typeof token !== 'string') {
+            return
+          }
+
+          if (token.length > 0) {
+            renewModelResponseDeadline()
+          }
+
+          if (!isPrivateResponse) {
+            if (token.trim()) {
+              clearModelStatus()
+            }
+
+            this.answerStream.push(token)
+          }
+        },
+        onReasoningToken: (reasoningChunk: string): void => {
+          if (cancellationSignal.aborted) {
+            return
+          }
+
+          if (reasoningChunk.length > 0) {
+            renewModelResponseDeadline()
+          }
+
+          if (shouldEmitReasoning && reasoningGenerationId) {
+            if (reasoningChunk) {
+              this.firstOutputAt ??= Date.now()
+            }
+
+            this.emitReasoningToken(reasoningChunk, reasoningGenerationId, phase)
+          }
+        },
+        ...(!isPrivateResponse
+          ? {
+              onToolCall: (call): void => {
+                if (cancellationSignal.aborted) {
+                  return
+                }
+
+                refreshWaitDiagnostics()
+                clearModelStatus()
+                const callable = functionsByToolName?.get(call.function.name)
+                if (!callable) {
+                  return
+                }
+
+                const previous = this.streamedToolCalls.get(call.id)
+                const input = call.function.arguments
+                if (previous?.input === input) {
+                  return
+                }
+
+                const groupId = previous?.groupId || `agent_${StringHelper.random(12)}`
+                this.streamedToolCalls.set(call.id, { callable, groupId, input })
+                this.firstOutputAt ??= Date.now()
+                this.reportProgressEvent({
+                  type: 'tool_call',
+                  toolCall: {
+                    id: groupId,
+                    name: callable.qualifiedName,
+                    status: 'preparing',
+                    input
+                  }
+                })
+                emitToolExecutionInputToWebApp({
+                  ...callable,
+                  toolGroupId: groupId,
+                  toolInput: input,
+                  status: 'preparing'
+                })
+              }
+            }
+          : {}),
+        promptCacheKey: AGENT_PROMPT_CACHE_KEY,
+        ...(inferencePolicy.textVerbosity
+          ? { textVerbosity: inferencePolicy.textVerbosity }
+          : {}),
+        ...(shouldEmitReasoning && inferencePolicy.reasoningSummary
+          ? { reasoningSummary: inferencePolicy.reasoningSummary }
+          : {}),
+        reasoningMode,
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+        ...(reasoningEffortBaseline ? { reasoningEffortBaseline } : {}),
+        ...(reasoningUseDefaultEffort ? { reasoningUseDefaultEffort: true } : {}),
+        ...(serviceTier ? { serviceTier } : {}),
+        ...(disableThinking ? { disableThinking: true } : {}),
+        // Review verdicts do not retain provider context for subsequent calls.
+        disableContextCompaction: isPrivateResponse || options.hasPendingImages || this.automaticCompactionFailed,
+        tools: preparedTools,
+        toolChoice,
+        signal: toolCallAbortController.signal,
+        cancellationSignal
+      })
+      if (completionResult) {
+        this.contextUsage = captureContextUsage({
+          // Agent prompts include system instructions. A zero count from an
+          // adapter means usage is unavailable, rather than an empty prompt.
+          usedInputTokens: completionResult.usedInputTokens || undefined,
+          estimatedInputTokens: preparedContext.estimatedInputTokens,
+          contextWindowTokens
+        })
+        modelStatus.contextUsage = this.contextUsage
+        emitModelStatus(ModelResponseState.Completed)
+      }
+
+      if (!completionResult && lastAttemptFailureKind === CompletionFailureKind.Timeout) {
+        throw new AgentModelResponseTimeoutError(lastAttemptDiagnostics)
+      }
+    } catch (error) {
+      executionSignal?.throwIfAborted()
+      if (error instanceof AgentModelResponseTimeoutError) {
+        // Preserve the checkpoint without another request to the unavailable model.
+        this.continuationSummaryFailed = true
+        this.answerStream.discard()
+      }
+
+      throw error
+    } finally {
+      if (options.isCompletionReview) {
+        this.reviewDurationMs += Math.max(0, Date.now() - completionStartedAt)
+      }
+      completed = true
+      clearTimeout(responseDeadlineTimer)
+      executionSignal?.removeEventListener('abort', clearModelStatus)
+      clearModelStatus()
+      clearWaitDiagnostics()
+    }
+
+    executionSignal?.throwIfAborted()
+    if (!completionResult) {
+      LogHelper.debug('callAgentModel: no completion result returned')
+      const providerError = LLM_PROVIDER.consumeLastProviderErrorMessage()
+      if (providerError) {
+        throw new AgentModelProviderError(
+          providerError,
+          !options.isContextRecoveryAttempt &&
+            lastAttemptFailureKind === CompletionFailureKind.Context,
+          lastAttemptFailureKind ?? CompletionFailureKind.Provider,
+          lastAttemptDiagnostics
+        )
+      }
+      return null
+    }
+
+    const completionEndedAt = Date.now()
+    const toolCalls = (
+      completionResult as unknown as { toolCalls?: OpenAIToolCall[] }
+    ).toolCalls
+    const observedPhase: AgentPhase =
+      !isPrivateResponse && (!toolCalls || toolCalls.length === 0) ? 'final_answer' : phase
+    this.observeCompletionMetrics({
+      phase: observedPhase,
+      completionStartedAt,
+      completedAt: completionEndedAt,
+      output: completionResult.output,
+      reasoning: completionResult.reasoning,
+      usedInputTokens: completionResult.usedInputTokens,
+      accounting: completionResult.accounting,
+      usedOutputTokens: completionResult.usedOutputTokens,
+      providerDecodeDurationMs: completionResult.providerDecodeDurationMs,
+      providerTokensPerSecond: completionResult.providerTokensPerSecond,
+      generationDurationMs: completionResult.generationDurationMs,
+      firstTokenAt: completionResult.firstTokenAt
+    })
+
+    if (toolCalls && toolCalls.length > 0) {
+      const allowedToolNames = new Set(
+        preparedTools.map((t) => t.function.name)
+      )
+      const normalizedToolCalls = toolCalls.map((toolCall) => {
+        const normalizedName = this.resolveAllowedToolCallName(
+          toolCall.function.name,
+          allowedToolNames
+        )
+
+        if (!normalizedName || normalizedName === toolCall.function.name) {
+          return toolCall
+        }
+
+        return {
+          ...toolCall,
+          function: {
+            ...toolCall.function,
+            name: normalizedName
+          }
+        }
+      })
+      this.logTitle(phase)
+      LogHelper.debug(
+        `callAgentModel: ${normalizedToolCalls.length} tool call(s) received`
+      )
+      const textContent =
+        typeof completionResult.output === 'string'
+          ? completionResult.output
+          : ''
+      return {
+        toolCalls: normalizedToolCalls,
+        textContent,
+        ...(completionResult.compactionContext
+          ? { compactionContext: completionResult.compactionContext }
+          : {}),
+        ...(completionResult.providerMessage
+          ? { providerMessage: completionResult.providerMessage }
+          : {}),
+        ...(completionResult.reasoningItems?.length
+          ? { reasoningItems: completionResult.reasoningItems }
+          : {}),
+        ...(providerName === LLMProviders.DeepSeek && completionResult.reasoning
+          ? { reasoning: completionResult.reasoning }
+          : {}),
+        ...(completionResult.finishReason !== undefined
+          ? {
+              isTruncated: this.isTruncatedFinishReason(
+                completionResult.finishReason
+              )
+            }
+          : {})
+      }
+    }
+
+    let textContent =
+      typeof completionResult.output === 'string'
+        ? completionResult.output
+        : ''
+
+    // JSON-mode providers return a parsed verdict; the loop validates its text.
+    if (
+      isPrivateResponse &&
+      completionResult.output &&
+      typeof completionResult.output === 'object'
+    ) {
+      textContent = JSON.stringify(completionResult.output)
+    }
+
+    this.logTitle(phase)
+    LogHelper.debug(
+      `callAgentModel: final text response received (${textContent.length} chars)`
+    )
+    return {
+      textContent,
+      ...(completionResult.compactionContext
+        ? { compactionContext: completionResult.compactionContext }
+        : {}),
+      ...(completionResult.providerMessage
+        ? { providerMessage: completionResult.providerMessage }
+        : {}),
+      ...(completionResult.reasoningItems?.length
+        ? { reasoningItems: completionResult.reasoningItems }
+        : {}),
+      ...(providerName === LLMProviders.DeepSeek && completionResult.reasoning
+        ? { reasoning: completionResult.reasoning }
+        : {}),
+      ...(completionResult.finishReason !== undefined
+        ? {
+            isTruncated: this.isTruncatedFinishReason(
+              completionResult.finishReason
+            )
+          }
+        : {})
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+
+  private safeJSONStringify(value: unknown): string {
+    try {
+      // Opaque replay data belongs in the provider request, not diagnostic prose.
+      return JSON.stringify(value, (key, content) => {
+        if (key === 'sourceTranscript') {
+          return undefined
+        }
+
+        return key === 'encryptedContent' || key === 'encrypted_content'
+          ? '[provider context retained]'
+          : content
+      })
+    } catch {
+      return String(value)
+    }
+  }
+
+  private isTruncatedFinishReason(finishReason: string): boolean {
+    return TRUNCATED_COMPLETION_FINISH_REASONS.has(
+      finishReason.toLowerCase()
+    )
+  }
+
+  private resolveAllowedToolCallName(
+    requestedName: string,
+    allowedToolNames: Set<string>
+  ): string | null {
+    const normalizedRequested = String(requestedName || '').trim()
+    if (!normalizedRequested) {
+      return null
+    }
+
+    if (allowedToolNames.has(normalizedRequested)) {
+      return normalizedRequested
+    }
+
+    const allowList = [...allowedToolNames]
+    const lowerMatches = allowList.filter(
+      (toolName) => toolName.toLowerCase() === normalizedRequested.toLowerCase()
+    )
+    if (lowerMatches.length === 1) {
+      return lowerMatches[0] || null
+    }
+
+    const tailCandidate = normalizedRequested
+      .split(/[./:]/)
+      .filter(Boolean)
+      .pop()
+    if (!tailCandidate) {
+      return null
+    }
+
+    if (allowedToolNames.has(tailCandidate)) {
+      return tailCandidate
+    }
+
+    const lowerTailMatches = allowList.filter(
+      (toolName) => toolName.toLowerCase() === tailCandidate.toLowerCase()
+    )
+    if (lowerTailMatches.length === 1) {
+      return lowerTailMatches[0] || null
+    }
+
+    return null
+  }
+
+  private estimateTokensFromText(text: string): number {
+    if (!text) {
+      return 0
+    }
+
+    return Math.ceil(text.length / CHARS_PER_TOKEN)
+  }
+
+  private buildLogTitle(context?: string): string {
+    return context ? `${this.name} / ${context}` : this.name
+  }
+
+  private logTitle(context?: string): void {
+    LogHelper.title(this.buildLogTitle(context))
+  }
+
+  private writeAgentPromptLog(params: {
+    systemPrompt: string
+    prompt: string
+    tools: OpenAITool[]
+    toolChoice: 'auto' | 'none' | 'required'
+    phasePolicySummary?: string
+    shouldStream?: boolean
+  }): void {
+    try {
+      const agentPromptsLogPath = path.join(getProfilePaths().logs, 'prompts')
+
+      fs.mkdirSync(agentPromptsLogPath, { recursive: true })
+
+      const promptLogFilePath = path.join(
+        agentPromptsLogPath,
+        'agent.log'
+      )
+      const headerLines = [
+        `=== ${new Date().toISOString()} ===`,
+        'phase=agent',
+        'channel=tools',
+        `stream=${params.shouldStream === true ? 'true' : 'false'}`,
+        ...(params.phasePolicySummary
+          ? [`policy=${params.phasePolicySummary}`]
+          : []),
+        `tool_count=${params.tools.length}`,
+        `tool_choice=${params.toolChoice}`,
+        ''
+      ]
+      const sectionLines = [
+        '--- SYSTEM_PROMPT ---',
+        StringHelper.redactSecrets(params.systemPrompt),
+        '',
+        '--- AGENT_TRANSCRIPT ---',
+        StringHelper.redactSecrets(params.prompt),
+        ''
+      ]
+
+      if (params.tools.length > 0) {
+        sectionLines.push(
+          '--- TOOLS_SCHEMA ---',
+          this.safeJSONStringify(params.tools),
+          ''
+        )
+      }
+
+      fs.writeFileSync(
+        promptLogFilePath,
+        `${[...headerLines, ...sectionLines].join('\n')}\n`,
+        'utf8'
+      )
+    } catch (error) {
+      this.logTitle('agent')
+      LogHelper.warning(
+        `Failed to write prompt log file: ${String(error)}`
+      )
+    }
+  }
+
+  private logAgentPromptDispatch(params: {
+    estimatedInputTokens: number
+    prompt: string
+    systemPrompt: string
+    phasePolicySummary?: string
+    tools: OpenAITool[]
+    toolChoice: 'auto' | 'none' | 'required'
+    shouldStream?: boolean
+  }): void {
+    const systemTokens = this.estimateTokensFromText(params.systemPrompt)
+    const toolsTokens = this.estimateTokensFromText(
+      this.safeJSONStringify(params.tools)
+    )
+    const totalEstimated = params.estimatedInputTokens
+    const promptTokens = Math.max(0, totalEstimated - systemTokens - toolsTokens)
+
+    this.logTitle('agent')
+    LogHelper.debug(
+      `Prompt dispatch [tools] est_tokens=${totalEstimated} (transcript=${promptTokens}, system=${systemTokens}, tools=${toolsTokens})${
+        params.shouldStream === true ? ' | stream=true' : ''
+      }${
+        params.phasePolicySummary ? ` | ${params.phasePolicySummary}` : ''
+      } | tools=${params.tools.length} | tool_choice=${params.toolChoice}`
+    )
+    this.writeAgentPromptLog({
+      systemPrompt: params.systemPrompt,
+      prompt: params.prompt,
+      tools: params.tools,
+      toolChoice: params.toolChoice,
+      ...(params.phasePolicySummary !== undefined
+        ? { phasePolicySummary: params.phasePolicySummary }
+        : {}),
+      ...(params.shouldStream !== undefined
+        ? { shouldStream: params.shouldStream }
+        : {})
+    })
+  }
+
+  private logPromptUsage(
+    phase: AgentPhase,
+    usedInputTokens: number,
+    usedOutputTokens: number
+  ): void {
+    this.logTitle(phase)
+    LogHelper.debug(
+      `Prompt usage [tools] input=${usedInputTokens} output=${usedOutputTokens} | total=${this.totalInputTokens}+${this.totalOutputTokens}=${this.totalInputTokens + this.totalOutputTokens}`
+    )
+  }
+
+  private observeCompletionMetrics(params: {
+    accounting?: CompletionAccounting | undefined
+    phase: AgentPhase
+    completionStartedAt: number
+    completedAt: number
+    output?: unknown | undefined
+    reasoning?: string | undefined
+    usedInputTokens?: number | undefined
+    usedOutputTokens?: number | undefined
+    generationDurationMs?: number | undefined
+    providerDecodeDurationMs?: number | undefined
+    providerTokensPerSecond?: number | undefined
+    firstTokenAt?: number | null | undefined
+  }): void {
+    const observedMetrics = observeCompletionMetrics({
+      providerName: getLLMProviderName(),
+      accumulator: {
+        completionCount: this.completionCount,
+        usageAccounting: this.usageAccounting,
+        totalInputTokens: this.totalInputTokens,
+        totalOutputTokens: this.totalOutputTokens,
+        totalVisibleOutputTokens: this.totalVisibleOutputTokens,
+        totalOutputChars: this.totalOutputChars,
+        totalGenerationDurationMs: this.totalGenerationDurationMs,
+        phaseMetrics: this.phaseMetrics,
+        finalAnswerMetrics: this.finalAnswerMetrics
+      } satisfies AccumulatedLLMMetricsState,
+      phase: params.phase,
+      completionStartedAt: params.completionStartedAt,
+      completedAt: params.completedAt,
+      output: params.output,
+      reasoning: params.reasoning,
+      usedInputTokens: params.usedInputTokens,
+      accounting: params.accounting,
+      usedOutputTokens: params.usedOutputTokens,
+      generationDurationMs: params.generationDurationMs,
+      providerDecodeDurationMs: params.providerDecodeDurationMs,
+      providerTokensPerSecond: params.providerTokensPerSecond,
+      ...(params.firstTokenAt ? { firstTokenAt: params.firstTokenAt } : {}),
+      estimateTokensFromText: this.estimateTokensFromText.bind(this)
+    })
+    this.completionCount = observedMetrics.accumulator.completionCount
+    this.usageAccounting = observedMetrics.accumulator.usageAccounting
+    this.totalInputTokens = observedMetrics.accumulator.totalInputTokens
+    this.totalOutputTokens = observedMetrics.accumulator.totalOutputTokens
+    this.totalVisibleOutputTokens =
+      observedMetrics.accumulator.totalVisibleOutputTokens
+    this.totalOutputChars = observedMetrics.accumulator.totalOutputChars
+    this.totalGenerationDurationMs =
+      observedMetrics.accumulator.totalGenerationDurationMs
+    this.phaseMetrics = observedMetrics.accumulator.phaseMetrics
+    this.finalAnswerMetrics = observedMetrics.accumulator.finalAnswerMetrics
+
+    this.logPromptUsage(
+      params.phase,
+      params.usedInputTokens ?? 0,
+      params.usedOutputTokens ?? 0
+    )
+    this.logPromptReasoning(params.phase, params.reasoning)
+  }
+
+  private logPromptReasoning(
+    phase: AgentPhase,
+    reasoning?: string
+  ): void {
+    this.logTitle(phase)
+    if (reasoning && reasoning.trim()) {
+      LogHelper.debug(`Prompt reasoning [tools]:\n${reasoning.trim()}`)
+      return
+    }
+
+    LogHelper.debug('Prompt reasoning [tools]: none')
+  }
+
+  /**
+   * Keeps pending-request diagnostics in server logs rather than owner messages.
+   */
+  private logLongToolCallDiagnosis(
+    totalEstimatedTokens: number,
+    tools: OpenAITool[],
+    phase: AgentPhase,
+    toolChoice: string
+  ): void {
+    const toolSchemaTokens = this.estimateTokensFromText(JSON.stringify(tools))
+    const promptTokens = Math.max(0, totalEstimatedTokens - toolSchemaTokens)
+
+    this.logTitle('execution')
+    LogHelper.warning(
+      `Model progress stalled (> ${AGENT_TOOL_CALL_DIAGNOSIS_DELAY_MS}ms): provider=${getLLMProviderName()}, phase=${phase}, tool choice=${toolChoice}, tools=${tools.length}, approximate input tokens=${totalEstimatedTokens} (prompt=${promptTokens}, tool schemas=${toolSchemaTokens}).`
+    )
+  }
+
+  private async emitProgress(
+    message: string,
+    generationId: string | null = null
+  ): Promise<void> {
+    if (!message) {
+      return
+    }
+
+    const id = `agent-progress-${StringHelper.random(8, { onlyLetters: true })}`
+    const createdAt = Date.now()
+
+    // Hosts receive the same non-final message as the built-in chat client.
+    this.reportProgressEvent({
+      type: 'progress_message',
+      message: { id, content: message, createdAt }
+    })
+    try {
+      SOCKET_SERVER.emitAnswerToChatClients({
+        id,
+        messageId: id,
+        sentAt: createdAt,
+        answer: message,
+        generationId,
+        fallbackText: message,
+        historyMode: 'system_widget'
+      })
+    } catch (error) {
+      this.logTitle('execution')
+      LogHelper.warning(
+        `Failed to emit intermediate progress message: ${String(error)}`
+      )
+    }
+  }
+
+  private makeDutyResult(output: string): LLMDutyResult {
+    if (!this.hasFinalizedAnswer) {
+      throw new Error(
+        'Agent invariant violation: user-facing output must be finalized before creating a duty result.'
+      )
+    }
+
+    const normalizedOutput = StringHelper.normalizeUserFacingText(output)
+
+    // The normal answer event settles the active bubble with accepted text,
+    // including review edits or runtime-generated endings, without replaying tokens.
+    this.answerStream.finish()
+
+    this.logTitle('final_answer')
+    LogHelper.success('Duty executed')
+    LogHelper.success(`Output — ${normalizedOutput}`)
+    LogHelper.debug(
+      `Total tokens — input: ${this.totalInputTokens} | output: ${this.totalOutputTokens} | combined: ${this.totalInputTokens + this.totalOutputTokens}`
+    )
+
+    const generationMetrics = deriveLLMMetrics({
+      contextUsage: this.contextUsage,
+      usageAccounting: this.usageAccounting,
+      completionCount: this.completionCount,
+      providerName: getLLMProviderName(),
+      normalizedOutput,
+      totalInputTokens: this.totalInputTokens,
+      totalOutputTokens: this.totalOutputTokens,
+      totalVisibleOutputTokens: this.totalVisibleOutputTokens,
+      totalOutputChars: this.totalOutputChars,
+      totalGenerationDurationMs: this.totalGenerationDurationMs,
+      turnDurationMs: Math.max(Date.now() - this.executionStartedAt, 0),
+      turnTtftMs: this.firstOutputAt === null
+        ? undefined
+        : Math.max(this.firstOutputAt - this.executionStartedAt, 0),
+      phaseMetrics: this.phaseMetrics,
+      finalAnswerMetrics: this.finalAnswerMetrics,
+      estimateTokensFromText: this.estimateTokensFromText.bind(this)
+    })
+    const llmMetrics = {
+      ...generationMetrics,
+      reviewCount: this.reviewCount,
+      reviewRetryCount: this.reviewRetryCount,
+      reviewDurationMs: this.reviewDurationMs
+    }
+    const agentResponseTrace = this.responseTraceCollector.snapshot({
+      ...llmMetrics
+    })
+
+    return {
+      dutyType: LLMDuties.ReAct,
+      systemPrompt: this.systemPrompt,
+      input: this.input,
+      output: normalizedOutput,
+      data: {
+        hasExplicitMemoryWrite: this.hasExplicitMemoryWrite,
+        hasOwnerMessages: this.hasOwnerMessages,
+        finalIntent: this.finalResponseIntent,
+        llmMetrics,
+        agentResponseTrace,
+        executionHistory: this.lastExecutionHistory.map((item) => ({
+          function: item.function,
+          status: item.status,
+          observation: item.observation,
+          startedAt: item.startedAt,
+          completedAt: item.completedAt,
+          durationMs: item.durationMs,
+          stepLabel: item.stepLabel,
+          requestedToolInput: item.requestedToolInput
+        }))
+      }
+    } as unknown as LLMDutyResult
+  }
+
+  private emitReasoningToken(
+    token: string,
+    generationId: string,
+    phase: AgentPhase
+  ): void {
+    if (!token || !generationId) {
+      return
+    }
+
+    this.responseTraceCollector.recordReasoning(generationId, token, phase)
+    this.scheduleTraceSave()
+    // Preserve provider chunks; word-level events overwhelm long-running chat UIs.
+    SOCKET_SERVER.emitToChatClients('llm-reasoning-token', {
+      token,
+      generationId,
+      phase
+    })
+  }
+}
