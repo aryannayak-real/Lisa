@@ -41,8 +41,12 @@ jobs:
 
       - name: Install
         run: |
+          python -m pip install --user uv
+          export PATH="$HOME/.local/bin:$PATH"
           export LEON_PYTHON_PATH="$(command -v python)"
+          export LEON_UV_PATH="$(command -v uv)"
           echo "Using Python: $LEON_PYTHON_PATH"
+          echo "Using uv: $LEON_UV_PATH"
           pnpm install
 
       - name: Check setup
