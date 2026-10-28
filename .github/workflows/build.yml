@@ -40,7 +40,10 @@ jobs:
           cache: pnpm
 
       - name: Install
-        run: pnpm install
+        run: |
+          export LEON_PYTHON_PATH="$(command -v python)"
+          echo "Using Python: $LEON_PYTHON_PATH"
+          pnpm install
 
       - name: Check setup
         run: pnpm run check
