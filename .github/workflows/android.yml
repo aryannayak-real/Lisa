@@ -46,16 +46,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          ASSET="/tmp/lisa-${VERSION}-debug.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk "$ASSET"
           if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" \
-              "app/build/outputs/apk/debug/app-debug.apk#lisa-${VERSION}-debug.apk" \
-              --clobber
+            gh release upload "$GITHUB_REF_NAME" "$ASSET" --clobber
             gh release edit "$GITHUB_REF_NAME" \
               --title "Lisa $VERSION" \
               --notes-file RELEASE_NOTES.md
           else
-            gh release create "$GITHUB_REF_NAME" \
-              "app/build/outputs/apk/debug/app-debug.apk#lisa-${VERSION}-debug.apk" \
+            gh release create "$GITHUB_REF_NAME" "$ASSET" \
               --title "Lisa $VERSION" \
               --notes-file RELEASE_NOTES.md
           fi

@@ -13,3 +13,5 @@ Lisa can now use its embedded shell with your approval.
 Open **Terminal** once to install the bootstrap, then load a model and enable Agent. Works best with short, concrete tasks on the 0.8B model.
 
 Install note: this APK is debug-signed by CI, so uninstall any older Lisa build once before installing. Stable signing is still on the roadmap.
+
+SHA-256: `2c92e702a818ab28444020fa7698b4ec04eed65445a4d5cbd7d5ba42205c4c86`
