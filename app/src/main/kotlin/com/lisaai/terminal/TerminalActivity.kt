@@ -95,6 +95,12 @@ class TerminalActivity : Activity(), TerminalSessionClient, TerminalViewClient {
         view.setTextSize(32)
         view.setBackgroundColor(Color.BLACK)
 
+        try {
+            TerminalBootstrap.ensureAptRepoint(applicationContext)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Could not install apt repoint hook", t)
+        }
+
         val params = FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
         root.removeAllViews()
         root.addView(view, params)

@@ -1,5 +1,6 @@
 package com.lisaai.terminal
 
+import android.content.Context
 import android.system.Os
 import android.util.Log
 import java.io.File
@@ -84,6 +85,50 @@ object TerminalBootstrap {
         deleteRecursively(prefixDir)
         deleteRecursively(stagingDir)
         File(filesDir, "bootstrap-aarch64.zip").delete()
+    }
+
+    /**
+     * Installs the apt hook that repoints downloaded packages before dpkg
+     * unpacks them. Safe to call on every terminal start; it only rewrites the
+     * two small files when needed.
+     */
+    fun ensureAptRepoint(context: Context) {
+        if (!prefixDir.isDirectory) return
+
+        val script = File(prefixDir, "bin/lisa-repoint-debs")
+        context.assets.open("lisa-repoint-debs.sh").use { input ->
+            script.outputStream().use { output -> input.copyTo(output) }
+        }
+        Os.chmod(script.path, CHMOD_0700)
+
+        val aptConfDir = File(prefixDir, "etc/apt/apt.conf.d")
+        aptConfDir.mkdirs()
+        val conf = File(aptConfDir, "99lisa-repoint")
+        val desired = buildString {
+            append("DPkg::Pre-Install-Pkgs { \"")
+            append(script.path)
+            append("\"; };\n")
+            append("APT::Keep-Downloaded-Packages \"false\";\n")
+            append("DPkg::Post-Invoke { \"")
+            append(File(prefixDir, "bin/rm").path)
+            append(" -f ")
+            append(prefixDir.path)
+            append("/var/cache/apt/archives/*.deb ")
+            append(prefixDir.path)
+            append("/var/cache/apt/archives/*.deb.lisa-new\"; };\n")
+        }
+        if (!conf.isFile || conf.readText() != desired) {
+            conf.writeText(desired)
+        }
+
+        // A repointed .deb no longer matches apt's cached hash. Drop cached
+        // packages (and leftovers from an interrupted repack) at startup.
+        File(prefixDir, "var/cache/apt/archives").listFiles()?.forEach { file ->
+            val name = file.name
+            if (name.endsWith(".deb") || name.endsWith(".deb.lisa-new")) {
+                file.delete()
+            }
+        }
     }
 
     private fun download(dest: File, onProgress: (Int) -> Unit) {
