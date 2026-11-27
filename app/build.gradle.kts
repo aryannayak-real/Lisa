@@ -15,8 +15,8 @@ android {
         // targetSdk 28 keeps exec permission on the app private data directory,
         // which the bundled Termux bootstrap requires (sideload-only app).
         targetSdk = 28
-        versionCode = 5
-        versionName = "0.5.0"
+        versionCode = 6
+        versionName = "0.5.1"
 
         ndk {
             abiFilters += "arm64-v8a"

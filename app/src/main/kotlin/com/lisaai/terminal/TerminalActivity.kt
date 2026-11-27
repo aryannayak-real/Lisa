@@ -46,7 +46,10 @@ class TerminalActivity : Activity(), TerminalSessionClient, TerminalViewClient {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        window.setSoftInputMode(
+            WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
+                WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE,
+        )
 
         fontSize = getSharedPreferences(PREFS, MODE_PRIVATE)
             .getInt(PREF_FONT_SIZE, DEFAULT_FONT_SIZE)
@@ -119,6 +122,7 @@ class TerminalActivity : Activity(), TerminalSessionClient, TerminalViewClient {
             ),
         )
 
+        addKey(row, "BACK") { finish() }
         ctrlButton = addKey(row, "CTRL") { toggleCtrl() }
         altButton = addKey(row, "ALT") { toggleAlt() }
         addKey(row, "ESC") { sendKey(KeyEvent.KEYCODE_ESCAPE) }
@@ -267,6 +271,10 @@ class TerminalActivity : Activity(), TerminalSessionClient, TerminalViewClient {
         view.setTerminalViewClient(this)
         view.setTextSize(fontSize)
         view.setBackgroundColor(Color.BLACK)
+        // TerminalView is a plain View; unlike EditText it is not focusable by default.
+        // Without this requestFocus() fails and the soft keyboard never appears.
+        view.isFocusable = true
+        view.isFocusableInTouchMode = true
 
         try {
             TerminalBootstrap.ensureAptRepoint(applicationContext)
@@ -290,10 +298,7 @@ class TerminalActivity : Activity(), TerminalSessionClient, TerminalViewClient {
         view.attachSession(newSession)
 
         view.requestFocus()
-        view.post {
-            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-            imm.showSoftInput(view, 0)
-        }
+        view.postDelayed({ showKeyboard() }, 150)
     }
 
     override fun onDestroy() {
@@ -309,9 +314,11 @@ class TerminalActivity : Activity(), TerminalSessionClient, TerminalViewClient {
 
     private fun showKeyboard() {
         val view = terminalView ?: return
-        view.requestFocus()
+        if (!view.hasFocus()) {
+            view.requestFocus()
+        }
         val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        imm.showSoftInput(view, 0)
+        imm.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
     }
 
     // ----- TerminalSessionClient -----

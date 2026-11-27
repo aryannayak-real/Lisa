@@ -1,9 +1,13 @@
 package com.lisaai.ui
 
 import android.app.Application
+import android.content.Context
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.lisaai.data.ChatSession
+import com.lisaai.data.ChatStore
+import com.lisaai.data.ChatSummary
 import com.lisaai.data.ModelDownloader
 import com.lisaai.inference.Agent
 import com.lisaai.inference.LlamaEngine
@@ -17,6 +21,7 @@ import java.io.File
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -35,10 +40,14 @@ data class ChatUiState(
     val status: String = "No model loaded",
     val agentMode: Boolean = false,
     val pendingCommand: String? = null,
+    val chats: List<ChatSummary> = emptyList(),
+    val currentChatId: String? = null,
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
+    private val app = application
+    private val prefs = application.getSharedPreferences("lisa_settings", Context.MODE_PRIVATE)
     private val engine = LlamaEngine()
     private val _state = MutableStateFlow(ChatUiState())
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
@@ -46,8 +55,31 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val systemPrompt = "You are Lisa, a concise and helpful assistant running fully on this device."
 
     private var generationJob: Job? = null
+    private var persistJob: Job? = null
     private var stopRequested = false
     private var agentSteps = 0
+
+    init {
+        val currentId = ChatStore.currentId(app)
+            ?: ChatStore.newId().also { ChatStore.setCurrentId(app, it) }
+        val savedAgentMode = prefs.getBoolean(PREF_AGENT_MODE, false)
+
+        _state.update {
+            it.copy(agentMode = savedAgentMode, currentChatId = currentId)
+        }
+
+        viewModelScope.launch {
+            val session = withContext(Dispatchers.IO) { ChatStore.load(app, currentId) }
+            val chats = withContext(Dispatchers.IO) { ChatStore.list(app) }
+            _state.update {
+                it.copy(
+                    messages = session?.messages.orEmpty(),
+                    chats = chats,
+                    status = if (it.modelLoaded) "Ready" else it.status,
+                )
+            }
+        }
+    }
 
     fun onInput(value: String) = _state.update { it.copy(input = value) }
 
@@ -55,23 +87,117 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val current = _state.value
         if (current.generating) return
 
-        if (!enabled) {
-            _state.update { it.copy(agentMode = false, pendingCommand = null, status = "Ready") }
-            return
-        }
-
-        if (!TerminalBootstrap.isInstalled()) {
-            _state.update {
-                it.copy(
-                    agentMode = false,
-                    status = "Open Terminal once to set up the shell",
-                )
-            }
-            return
-        }
+        prefs.edit().putBoolean(PREF_AGENT_MODE, enabled).apply()
+        val installed = TerminalBootstrap.isInstalled()
 
         _state.update {
-            it.copy(agentMode = true, pendingCommand = null, status = "Ready")
+            it.copy(
+                agentMode = enabled,
+                pendingCommand = null,
+                status = when {
+                    enabled && !installed -> "Open Terminal once to set up the shell"
+                    it.status == "Open Terminal once to set up the shell" ->
+                        if (it.modelLoaded) "Ready" else "No model loaded"
+                    else -> it.status
+                },
+            )
+        }
+    }
+
+    fun newChat() {
+        if (_state.value.generating) return
+        viewModelScope.launch {
+            persistNow()
+            val id = ChatStore.newId()
+            val chats = withContext(Dispatchers.IO) {
+                runCatching {
+                    ChatStore.setCurrentId(app, id)
+                    ChatStore.list(app)
+                }.getOrDefault(emptyList())
+            }
+            agentSteps = 0
+            _state.update {
+                it.copy(
+                    messages = emptyList(),
+                    input = "",
+                    pendingCommand = null,
+                    currentChatId = id,
+                    chats = chats,
+                    status = if (it.modelLoaded) "Ready" else "No model loaded",
+                )
+            }
+        }
+    }
+
+    fun openChat(id: String) {
+        val current = _state.value
+        if (current.generating || id == current.currentChatId) return
+
+        viewModelScope.launch {
+            persistNow()
+            val session = withContext(Dispatchers.IO) {
+                runCatching {
+                    ChatStore.load(app, id)?.also { ChatStore.setCurrentId(app, id) }
+                }.getOrNull()
+            } ?: return@launch
+            val chats = withContext(Dispatchers.IO) {
+                runCatching { ChatStore.list(app) }.getOrDefault(emptyList())
+            }
+
+            agentSteps = 0
+            _state.update {
+                it.copy(
+                    messages = session.messages,
+                    input = "",
+                    pendingCommand = null,
+                    currentChatId = id,
+                    chats = chats,
+                    status = if (it.modelLoaded) "Ready" else "No model loaded",
+                )
+            }
+        }
+    }
+
+    private fun persist() {
+        val snapshot = _state.value
+        val id = snapshot.currentChatId ?: return
+        if (snapshot.messages.isEmpty()) return
+
+        val session = ChatSession(
+            id = id,
+            title = ChatStore.titleFor(snapshot.messages),
+            updatedAt = System.currentTimeMillis(),
+            messages = snapshot.messages,
+        )
+
+        persistJob?.cancel()
+        persistJob = viewModelScope.launch {
+            delay(250)
+            withContext(Dispatchers.IO) { runCatching { ChatStore.save(app, session) } }
+            val chats = withContext(Dispatchers.IO) {
+                runCatching { ChatStore.list(app) }.getOrDefault(emptyList())
+            }
+            _state.update { it.copy(chats = chats) }
+        }
+    }
+
+    private suspend fun persistNow() {
+        val snapshot = _state.value
+        val id = snapshot.currentChatId ?: return
+        if (snapshot.messages.isEmpty()) return
+
+        withContext(Dispatchers.IO) {
+            runCatching {
+                ChatStore.save(
+                    app,
+                    ChatSession(
+                        id = id,
+                        title = ChatStore.titleFor(snapshot.messages),
+                        updatedAt = System.currentTimeMillis(),
+                        messages = snapshot.messages,
+                    ),
+                )
+            }
         }
     }
 
@@ -163,8 +289,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun send() {
         val snapshot = _state.value
         val prompt = snapshot.input.trim()
-        if (prompt.isEmpty() || !snapshot.modelLoaded || snapshot.generating) return
+        if (prompt.isEmpty() || snapshot.generating) return
         if (snapshot.pendingCommand != null) return
+
+        if (!snapshot.modelLoaded) {
+            _state.update { it.copy(status = "Load a model first") }
+            return
+        }
 
         if (snapshot.agentMode && !TerminalBootstrap.isInstalled()) {
             _state.update { it.copy(status = "Open Terminal once to set up the shell") }
@@ -218,10 +349,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     status = "Ready",
                 )
             }
+            persist()
 
             if (stopRequested) {
                 stopRequested = false
                 _state.update { it.copy(generating = false, status = "Stopped") }
+                persist()
                 return@launch
             }
 
@@ -237,6 +370,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         ),
                     )
                 }
+                persist()
                 return@launch
             }
 
@@ -257,6 +391,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 ),
             )
         }
+        persist()
     }
 
     private fun generateReply(history: List<Message>, system: String) {
@@ -309,6 +444,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         ),
                     )
                 }
+                persist()
                 return@launch
             }
 
@@ -321,6 +457,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         messages = it.messages.replaceLast(visible.ifEmpty { "(stopped)" }),
                     )
                 }
+                persist()
                 return@launch
             }
 
@@ -345,6 +482,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
             }
+            persist()
         }
     }
 
@@ -393,6 +531,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         private const val MAX_CHAT_NEW_TOKENS = 512
         private const val MAX_AGENT_NEW_TOKENS = 768
         private const val MAX_AGENT_STEPS = 6
+        private const val PREF_AGENT_MODE = "agent_mode"
 
         const val DEFAULT_MODEL_URL =
             "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf"

@@ -8,10 +8,12 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -20,98 +22,268 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.NavigationDrawerItem
+import androidx.compose.material3.NavigationDrawerItemDefaults
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.lisaai.data.ChatSummary
 import com.lisaai.inference.Message
 import com.lisaai.inference.MessageKind
 import com.lisaai.inference.Role
 import com.lisaai.terminal.TerminalActivity
+import com.lisaai.terminal.TerminalBootstrap
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(vm: ChatViewModel = viewModel()) {
     val state by vm.state.collectAsState()
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+
+    var showSettings by remember { mutableStateOf(false) }
+
+    val versionName = remember(context) {
+        runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull().orEmpty()
+    }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) vm.importModel(uri)
     }
 
-    val context = LocalContext.current
+    fun openTerminal() {
+        context.startActivity(Intent(context, TerminalActivity::class.java))
+    }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text("Lisa")
-                        Text(state.status, style = MaterialTheme.typography.labelSmall)
-                    }
-                },
-                actions = {
-                    OutlinedButton(
-                        onClick = { context.startActivity(Intent(context, TerminalActivity::class.java)) },
-                    ) {
-                        Text("Terminal")
-                    }
-                    Spacer(Modifier.width(8.dp))
-                    if (state.modelLoaded) {
-                        Button(
-                            onClick = { picker.launch(arrayOf("*/*")) },
-                            enabled = !state.importing && !state.generating,
-                        ) {
-                            Text("Change model")
-                        }
-                    }
-                },
-            )
-        },
-    ) { padding ->
-        Column(Modifier.fillMaxSize().padding(padding)) {
-            MessageList(
-                state = state,
-                modifier = Modifier.weight(1f),
-                onDownload = vm::downloadDefaultModel,
-                onPickFile = { picker.launch(arrayOf("*/*")) },
-            )
-            AgentBar(state = state, onToggle = vm::setAgentMode)
-            val pendingCommand = state.pendingCommand
-            if (pendingCommand != null) {
-                Spacer(Modifier.height(8.dp))
-                CommandApproval(
-                    command = pendingCommand,
-                    onRun = vm::approvePendingCommand,
-                    onSkip = vm::skipPendingCommand,
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            ModalDrawerSheet {
+                DrawerContent(
+                    state = state,
+                    versionName = versionName,
+                    onNewChat = {
+                        vm.newChat()
+                        scope.launch { drawerState.close() }
+                    },
+                    onOpenChat = { id ->
+                        vm.openChat(id)
+                        scope.launch { drawerState.close() }
+                    },
+                    onSettings = {
+                        showSettings = true
+                        scope.launch { drawerState.close() }
+                    },
                 )
             }
-            Composer(
-                state = state,
-                onInput = vm::onInput,
-                onSend = vm::send,
-                onStop = vm::stop,
+        },
+    ) {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    navigationIcon = {
+                        IconButton(onClick = { scope.launch { drawerState.open() } }) {
+                            Text("☰", style = MaterialTheme.typography.titleLarge)
+                        }
+                    },
+                    title = {
+                        Column {
+                            Text("Lisa")
+                            Text(state.status, style = MaterialTheme.typography.labelSmall)
+                        }
+                    },
+                    actions = {
+                        OutlinedButton(onClick = ::openTerminal) {
+                            Text("Terminal")
+                        }
+                        Spacer(Modifier.width(8.dp))
+                    },
+                )
+            },
+        ) { padding ->
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .imePadding(),
+            ) {
+                MessageList(
+                    state = state,
+                    modifier = Modifier.weight(1f),
+                    onDownload = vm::downloadDefaultModel,
+                    onPickFile = { picker.launch(arrayOf("*/*")) },
+                )
+                ModeSwitcher(state = state, onMode = vm::setAgentMode)
+                val pendingCommand = state.pendingCommand
+                if (pendingCommand != null) {
+                    Spacer(Modifier.height(8.dp))
+                    CommandApproval(
+                        command = pendingCommand,
+                        onRun = vm::approvePendingCommand,
+                        onSkip = vm::skipPendingCommand,
+                    )
+                }
+                Composer(
+                    state = state,
+                    onInput = vm::onInput,
+                    onSend = vm::send,
+                    onStop = vm::stop,
+                )
+            }
+        }
+    }
+
+    if (showSettings) {
+        SettingsDialog(
+            state = state,
+            versionName = versionName,
+            onDismiss = { showSettings = false },
+            onAgentMode = vm::setAgentMode,
+            onTerminal = {
+                showSettings = false
+                openTerminal()
+            },
+            onPickModel = {
+                showSettings = false
+                picker.launch(arrayOf("*/*"))
+            },
+            onNewChat = {
+                showSettings = false
+                vm.newChat()
+            },
+        )
+    }
+}
+
+@Composable
+private fun DrawerContent(
+    state: ChatUiState,
+    versionName: String,
+    onNewChat: () -> Unit,
+    onOpenChat: (String) -> Unit,
+    onSettings: () -> Unit,
+) {
+    Column(Modifier.fillMaxHeight().padding(vertical = 24.dp)) {
+        Text(
+            text = "Lisa",
+            style = MaterialTheme.typography.headlineSmall,
+            modifier = Modifier.padding(horizontal = 28.dp),
+        )
+        Text(
+            text = "Local-first chat",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 28.dp, vertical = 2.dp),
+        )
+        Spacer(Modifier.height(16.dp))
+
+        NavigationDrawerItem(
+            label = { Text("New chat") },
+            selected = false,
+            onClick = onNewChat,
+            modifier = Modifier.padding(NavigationDrawerItemDefaults.ItemPadding),
+        )
+
+        HorizontalDivider(Modifier.padding(vertical = 12.dp))
+        Text(
+            text = "Recent chats",
+            style = MaterialTheme.typography.labelLarge,
+            modifier = Modifier.padding(horizontal = 28.dp, vertical = 4.dp),
+        )
+
+        LazyColumn(Modifier.weight(1f)) {
+            if (state.chats.isEmpty()) {
+                item {
+                    Text(
+                        text = "No saved chats yet",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 28.dp, vertical = 12.dp),
+                    )
+                }
+            }
+            items(state.chats, key = { it.id }) { chat ->
+                ChatDrawerItem(
+                    chat = chat,
+                    selected = chat.id == state.currentChatId,
+                    onClick = { onOpenChat(chat.id) },
+                )
+            }
+        }
+
+        HorizontalDivider(Modifier.padding(vertical = 12.dp))
+        NavigationDrawerItem(
+            label = { Text("Settings") },
+            selected = false,
+            onClick = onSettings,
+            modifier = Modifier.padding(NavigationDrawerItemDefaults.ItemPadding),
+        )
+        if (versionName.isNotBlank()) {
+            Text(
+                text = "Lisa $versionName",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 28.dp, vertical = 8.dp),
             )
         }
     }
+}
+
+@Composable
+private fun ChatDrawerItem(chat: ChatSummary, selected: Boolean, onClick: () -> Unit) {
+    NavigationDrawerItem(
+        label = {
+            Text(
+                text = chat.title,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+        selected = selected,
+        onClick = onClick,
+        modifier = Modifier.padding(NavigationDrawerItemDefaults.ItemPadding),
+    )
 }
 
 @Composable
@@ -127,6 +299,7 @@ private fun MessageList(
         state.messages.size,
         state.messages.lastOrNull()?.text,
         state.pendingCommand,
+        state.currentChatId,
     ) {
         if (state.messages.isNotEmpty()) listState.scrollToItem(state.messages.lastIndex)
     }
@@ -194,6 +367,13 @@ private fun ModelCard(state: ChatUiState, onDownload: () -> Unit, onPickFile: ()
                 style = MaterialTheme.typography.bodySmall,
             )
         }
+        Spacer(Modifier.height(12.dp))
+        Text(
+            text = "No model loaded yet? Pick one above, then type below.",
+            textAlign = TextAlign.Center,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
@@ -261,28 +441,39 @@ private fun MessageBubble(message: Message) {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AgentBar(state: ChatUiState, onToggle: (Boolean) -> Unit) {
+private fun ModeSwitcher(state: ChatUiState, onMode: (Boolean) -> Unit) {
+    val terminalReady = TerminalBootstrap.isInstalled()
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         FilterChip(
+            selected = !state.agentMode,
+            onClick = { onMode(false) },
+            enabled = !state.generating,
+            label = { Text("Chat") },
+        )
+        FilterChip(
             selected = state.agentMode,
-            onClick = { onToggle(!state.agentMode) },
-            enabled = state.modelLoaded && !state.generating,
+            onClick = { onMode(true) },
+            enabled = !state.generating,
             label = { Text("Agent") },
         )
-        Spacer(Modifier.width(8.dp))
         Text(
-            text = if (state.agentMode) {
-                "Lisa proposes shell commands; you approve each one."
-            } else {
-                "Chat only"
+            text = when {
+                !state.modelLoaded -> "Load a model (☰ → Settings)"
+                state.agentMode && !terminalReady -> "Open Terminal once"
+                state.agentMode -> "Commands need approval"
+                else -> "Chat only"
             },
             style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            color = if (!state.modelLoaded || (state.agentMode && !terminalReady)) {
+                MaterialTheme.colorScheme.error
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
             modifier = Modifier.weight(1f),
         )
     }
@@ -337,7 +528,13 @@ private fun Composer(
                 )
             },
             maxLines = 5,
-            enabled = state.modelLoaded && state.pendingCommand == null,
+            enabled = !state.generating && state.pendingCommand == null,
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+            keyboardActions = KeyboardActions(
+                onSend = {
+                    if (state.input.isNotBlank() && state.pendingCommand == null) onSend()
+                },
+            ),
         )
 
         if (state.generating) {
@@ -345,12 +542,80 @@ private fun Composer(
         } else {
             Button(
                 onClick = onSend,
-                enabled = state.modelLoaded &&
-                    state.input.isNotBlank() &&
-                    state.pendingCommand == null,
+                enabled = state.input.isNotBlank() &&
+                    state.pendingCommand == null &&
+                    !state.generating,
             ) {
                 Text("Send")
             }
         }
     }
+}
+
+@Composable
+private fun SettingsDialog(
+    state: ChatUiState,
+    versionName: String,
+    onDismiss: () -> Unit,
+    onAgentMode: (Boolean) -> Unit,
+    onTerminal: () -> Unit,
+    onPickModel: () -> Unit,
+    onNewChat: () -> Unit,
+) {
+    val terminalReady = TerminalBootstrap.isInstalled()
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Settings") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Agent mode")
+                        Text(
+                            text = "Lisa proposes commands; you approve each one.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = state.agentMode,
+                        onCheckedChange = onAgentMode,
+                        enabled = !state.generating,
+                    )
+                }
+
+                if (!terminalReady) {
+                    Text(
+                        text = "Open Terminal once to install the shell.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+
+                HorizontalDivider()
+                Text(
+                    text = if (state.modelLoaded) "Model loaded" else "No model loaded",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = onTerminal) { Text("Terminal") }
+                    OutlinedButton(onClick = onPickModel) { Text("Change model") }
+                }
+
+                HorizontalDivider()
+                OutlinedButton(onClick = onNewChat) { Text("New chat") }
+
+                Text(
+                    text = if (versionName.isBlank()) "Lisa" else "Lisa $versionName · on-device",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Done") }
+        },
+    )
 }

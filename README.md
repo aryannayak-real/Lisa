@@ -6,9 +6,10 @@ copy in app storage.
 
 ## Status
 
-Early development (`0.5.0`). One model loaded at a time, CPU inference, ARM64.
-Includes an embedded Termux-style terminal with `pkg`/`apt` support, a control-key row,
-and an approval-based agent mode that can run shell commands for the model.
+Early development (`0.5.1`). One model loaded at a time, CPU inference, ARM64.
+Includes saved chat history, a settings drawer, an embedded Termux-style terminal with
+`pkg`/`apt` support, a control-key row, and an approval-based agent mode that can run shell
+commands for the model.
 
 ## What is here
 
@@ -24,7 +25,7 @@ and an approval-based agent mode that can run shell commands for the model.
 
 Agent mode lets the model use the shell. Tap the **Agent** chip next to the composer
 after loading a model. The first time, open **Terminal** once so the bootstrap is
-installed.
+installed. The **Chat** chip switches back to normal conversation.
 
 1. Ask for something that needs the shell.
 2. The model replies with one proposed command wrapped in `<lisa-run>…</lisa-run>`.
@@ -70,6 +71,7 @@ installs because the repacked files no longer match the original hashes.
 
 A key row sits above the keyboard:
 
+- **Back** closes the terminal and returns to the chat.
 - **Ctrl** and **Alt** toggle latches. With Ctrl on, typing `C` sends Ctrl+C, `D` sends
   Ctrl+D, and so on. Tap the key again to release it.
 - **Esc**, **Tab**, arrows, Home, End, PgUp, PgDn, and Delete send the expected sequences.
@@ -78,6 +80,19 @@ A key row sits above the keyboard:
 
 The terminal still has no shared-storage access and no background service, so long-running
 jobs can be killed when the app is backgrounded.
+
+## Chats and settings
+
+Tap the **☰** button to open the drawer:
+
+- **New chat** starts a fresh conversation.
+- **Recent chats** lists saved conversations. Lisa writes each chat to app-private storage
+  after replies and commands, and reopens the last chat on launch.
+- **Settings** shows whether a model is loaded and includes the agent switch, the Terminal
+  button, the model picker, and New chat.
+
+The composer is always tappable, even before a model is loaded. Sending without a model
+shows a reminder instead of dropping the message.
 
 ## Build
 
