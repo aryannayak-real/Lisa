@@ -12,3 +12,5 @@ The embedded terminal now has a control-key row, so you can actually drive the s
 Open **Terminal** as before. Agent mode is unchanged and still requires approval for every command.
 
 Install note: this APK is debug-signed by CI, so uninstall any older Lisa build once before installing. Stable signing is still on the roadmap.
+
+SHA-256: `0ca2a715033bdee875eed74efde84f090fa0296fe427394d88261c11746519de`
