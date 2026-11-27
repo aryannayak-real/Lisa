@@ -2,7 +2,14 @@ package com.lisaai.inference
 
 enum class Role { User, Assistant }
 
-data class Message(val role: Role, val text: String)
+/** How a message should be shown in the UI and, for commands, encoded for the model. */
+enum class MessageKind { Text, Command, Output, Note }
+
+data class Message(
+    val role: Role,
+    val text: String,
+    val kind: MessageKind = MessageKind.Text,
+)
 
 /**
  * ChatML formatting used by the Qwen family. Thinking is disabled with `/no_think`
@@ -19,9 +26,14 @@ object Prompt {
         append(IM_END).append('\n')
 
         for (message in messages) {
+            if (message.kind == MessageKind.Note) continue
+            val content = when (message.kind) {
+                MessageKind.Command -> "<lisa-run>${message.text.trim()}</lisa-run>"
+                else -> message.text.trim()
+            }
             append(IM_START)
             append(if (message.role == Role.User) "user" else "assistant")
-            append('\n').append(message.text.trim()).append(IM_END).append('\n')
+            append('\n').append(content).append(IM_END).append('\n')
         }
 
         append(IM_START).append("assistant\n")

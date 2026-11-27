@@ -40,6 +40,16 @@ class LlamaEngine {
             }
         }
 
+    /** Token count for the loaded model, or null when no model is loaded. */
+    suspend fun countTokens(text: String): Int? = withContext(Dispatchers.IO) {
+        val active = handle
+        if (active == 0L) {
+            null
+        } else {
+            mutex.withLock { LlamaNative.nativeTokenCount(active, text) }
+        }
+    }
+
     fun generate(prompt: String, maxTokens: Int, temperature: Float): Flow<String> = callbackFlow {
         val active = handle
         if (active == 0L) {

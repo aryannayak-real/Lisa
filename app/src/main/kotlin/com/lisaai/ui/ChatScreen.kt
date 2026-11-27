@@ -11,15 +11,19 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -35,10 +39,12 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.lisaai.inference.Message
+import com.lisaai.inference.MessageKind
 import com.lisaai.inference.Role
 import com.lisaai.terminal.TerminalActivity
 
@@ -88,6 +94,16 @@ fun ChatScreen(vm: ChatViewModel = viewModel()) {
                 onDownload = vm::downloadDefaultModel,
                 onPickFile = { picker.launch(arrayOf("*/*")) },
             )
+            AgentBar(state = state, onToggle = vm::setAgentMode)
+            val pendingCommand = state.pendingCommand
+            if (pendingCommand != null) {
+                Spacer(Modifier.height(8.dp))
+                CommandApproval(
+                    command = pendingCommand,
+                    onRun = vm::approvePendingCommand,
+                    onSkip = vm::skipPendingCommand,
+                )
+            }
             Composer(
                 state = state,
                 onInput = vm::onInput,
@@ -107,7 +123,11 @@ private fun MessageList(
 ) {
     val listState = rememberLazyListState()
 
-    LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.text) {
+    LaunchedEffect(
+        state.messages.size,
+        state.messages.lastOrNull()?.text,
+        state.pendingCommand,
+    ) {
         if (state.messages.isNotEmpty()) listState.scrollToItem(state.messages.lastIndex)
     }
 
@@ -179,25 +199,114 @@ private fun ModelCard(state: ChatUiState, onDownload: () -> Unit, onPickFile: ()
 
 @Composable
 private fun MessageBubble(message: Message) {
+    if (message.kind == MessageKind.Note) {
+        Text(
+            text = message.text,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+        return
+    }
+
     val fromUser = message.role == Role.User
+    val isCommand = message.kind == MessageKind.Command
+    val isOutput = message.kind == MessageKind.Output
+    val monospace = isCommand || isOutput
+
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = if (fromUser) Arrangement.End else Arrangement.Start,
     ) {
         Surface(
-            color = if (fromUser) {
-                MaterialTheme.colorScheme.primaryContainer
-            } else {
-                MaterialTheme.colorScheme.surfaceVariant
+            color = when {
+                isCommand -> MaterialTheme.colorScheme.secondaryContainer
+                isOutput -> MaterialTheme.colorScheme.surfaceVariant
+                fromUser -> MaterialTheme.colorScheme.primaryContainer
+                else -> MaterialTheme.colorScheme.surfaceVariant
             },
-            shape = RoundedCornerShape(16.dp),
-            modifier = Modifier.widthIn(max = 320.dp),
+            shape = RoundedCornerShape(if (monospace) 12.dp else 16.dp),
+            modifier = if (monospace) Modifier.fillMaxWidth() else Modifier.widthIn(max = 320.dp),
         ) {
+            Column(Modifier.padding(12.dp)) {
+                if (monospace) {
+                    Text(
+                        text = if (isCommand) "COMMAND" else "OUTPUT",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                }
+                Text(
+                    text = when {
+                        isCommand -> "$ ${message.text}"
+                        message.text.isEmpty() -> "..."
+                        else -> message.text
+                    },
+                    fontFamily = if (monospace) FontFamily.Monospace else FontFamily.Default,
+                    style = if (monospace) {
+                        MaterialTheme.typography.bodySmall
+                    } else {
+                        MaterialTheme.typography.bodyMedium
+                    },
+                    modifier = if (isOutput) {
+                        Modifier.heightIn(max = 260.dp).verticalScroll(rememberScrollState())
+                    } else {
+                        Modifier
+                    },
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AgentBar(state: ChatUiState, onToggle: (Boolean) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        FilterChip(
+            selected = state.agentMode,
+            onClick = { onToggle(!state.agentMode) },
+            enabled = state.modelLoaded && !state.generating,
+            label = { Text("Agent") },
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = if (state.agentMode) {
+                "Lisa proposes shell commands; you approve each one."
+            } else {
+                "Chat only"
+            },
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+@Composable
+private fun CommandApproval(command: String, onRun: () -> Unit, onSkip: () -> Unit) {
+    Surface(
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Text("Run this command?", style = MaterialTheme.typography.titleSmall)
             Text(
-                text = message.text.ifEmpty { "..." },
-                style = MaterialTheme.typography.bodyMedium,
-                modifier = Modifier.padding(12.dp),
+                text = "$ $command",
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(vertical = 8.dp),
             )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = onRun) { Text("Run") }
+                OutlinedButton(onClick = onSkip) { Text("Skip") }
+            }
         }
     }
 }
@@ -218,9 +327,17 @@ private fun Composer(
             value = state.input,
             onValueChange = onInput,
             modifier = Modifier.weight(1f),
-            placeholder = { Text("Message Lisa") },
+            placeholder = {
+                Text(
+                    if (state.pendingCommand != null) {
+                        "Approve or skip the command above"
+                    } else {
+                        "Message Lisa"
+                    }
+                )
+            },
             maxLines = 5,
-            enabled = state.modelLoaded,
+            enabled = state.modelLoaded && state.pendingCommand == null,
         )
 
         if (state.generating) {
@@ -228,7 +345,9 @@ private fun Composer(
         } else {
             Button(
                 onClick = onSend,
-                enabled = state.modelLoaded && state.input.isNotBlank(),
+                enabled = state.modelLoaded &&
+                    state.input.isNotBlank() &&
+                    state.pendingCommand == null,
             ) {
                 Text("Send")
             }

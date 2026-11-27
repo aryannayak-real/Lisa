@@ -6,17 +6,45 @@ copy in app storage.
 
 ## Status
 
-Early development (`0.3.0`). One model loaded at a time, CPU inference, ARM64.
-Includes an embedded Termux-style terminal with `pkg`/`apt` support.
+Early development (`0.4.0`). One model loaded at a time, CPU inference, ARM64.
+Includes an embedded Termux-style terminal with `pkg`/`apt` support and an approval-based
+agent mode that can run shell commands for the model.
 
 ## What is here
 
 - `app/src/main/cpp` — a small JNI bridge over llama.cpp (CMake + FetchContent).
 - `app/src/main/kotlin/com/lisaai/inference` — native binding, engine, UTF-8 streaming,
-  and ChatML prompt formatting.
+  ChatML prompt formatting, and the agent command protocol.
 - `app/src/main/kotlin/com/lisaai/ui` — Compose chat screen and state.
-- `app/src/main/kotlin/com/lisaai/terminal` — bootstrap installer and terminal activity.
+- `app/src/main/kotlin/com/lisaai/terminal` — bootstrap installer, terminal activity,
+  and the command executor used by agent mode.
 - `terminal-emulator/`, `terminal-view/` — Termux terminal modules (GPL-3.0-only).
+
+## Agent mode
+
+Agent mode lets the model use the shell. Tap the **Agent** chip next to the composer
+after loading a model. The first time, open **Terminal** once so the bootstrap is
+installed.
+
+1. Ask for something that needs the shell.
+2. The model replies with one proposed command wrapped in `<lisa-run>…</lisa-run>`.
+3. Lisa shows the exact command and waits. Tap **Run** or **Skip**.
+4. On **Run**, the command executes with `bash -c` in the embedded `$PREFIX`, with home
+   as the working directory. Stdout and stderr are captured.
+5. The output is fed back to the model, which can propose the next command or give the
+   final answer. Up to 6 commands per request.
+
+Every command requires explicit approval; Lisa never runs a model proposal
+automatically. Commands time out after 60 seconds, output is capped at 2,000 characters
+(both for display and for the model), and older turns are dropped to keep the prompt
+inside the 2,048-token context.
+
+Agent mode is not a security sandbox. The model can be wrong, and an approved command
+has the same access as the rest of the app: app-private storage only, no root. Read the
+command before running it.
+
+If the model ignores the marker, a fenced `sh`/`bash` block is also accepted as a
+command proposal.
 
 ## Terminal
 
@@ -51,15 +79,30 @@ The native library is fetched and built by CMake, so the first build needs netwo
 ## Use
 
 1. Install the debug APK.
-2. Tap **Load model** and pick a single-file `.gguf`.
-3. Chat.
+2. Tap **Load model** and pick a single-file `.gguf`, or download the default
+   Qwen3.5 0.8B Q4_K_M model.
+3. Chat. For shell work, open **Terminal** once, then enable **Agent**.
 
 For this class of hardware, start with a ~0.6B parameter model at `Q4_0`/`Q4_K_M` and a
 short context. Larger models are limited by memory bandwidth, not by the app.
 
+## Known limits
+
+- Releases are debug-signed by ephemeral CI runners, so installing a new version over an
+  old one currently needs a one-time uninstall. Stable signing is planned.
+- The terminal has no shared-storage access (`/sdcard`) and no background service, so
+  long-running jobs can be killed when the app is backgrounded.
+- Termux:API, Termux:X11, and widgets expect `com.termux` and do not work here.
+- Some `pkg` packages may still misbehave after repointing; installs are slower.
+- Small models are weak at planning. Agent mode works best for short, concrete tasks.
+
 ## Roadmap
 
-- Agent loop that can plan and act through the terminal.
+- Stable signing so future APKs update over each other.
+- Terminal key row (Ctrl / Alt / Esc / Tab / arrows) and font size.
+- Shared storage and a foreground service for long-running shell jobs.
+- Model settings (context, threads, temperature, system prompt) and a model catalog.
+- Richer agent loop (streamed command output, per-command timeouts, plan review).
 
 ## License
 
