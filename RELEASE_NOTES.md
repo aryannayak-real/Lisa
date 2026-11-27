@@ -1,17 +1,14 @@
-Lisa 0.4.0 — Agent Mode
+Lisa 0.5.0 — Terminal Controls
 
-Lisa can now use its embedded shell with your approval.
+The embedded terminal now has a control-key row, so you can actually drive the shell.
 
-- New **Agent** chip next to the composer.
-- The model proposes one command at a time using `<lisa-run>…</lisa-run>` (fenced `sh`/`bash` blocks are accepted as a fallback).
-- The exact command is shown in an approval card with **Run** and **Skip**. Nothing runs automatically.
-- On approval it runs with `bash -c` in the embedded `$PREFIX`, with home as the working directory; stdout and stderr are captured.
-- Output is fed back to the model for up to 6 commands per request, with a 60-second timeout and a 2,000-character output cap.
-- Prompts are trimmed to fit the 2,048-token context.
-- README updated with setup, safety notes, and limits.
+- **CTRL** and **ALT** toggle latches. Turn on Ctrl, type `C` on the keyboard, and the terminal receives Ctrl+C. Tap again to release.
+- **ESC**, **TAB**, arrows, Home, End, PgUp, PgDn, and Delete send the correct escape sequences.
+- **PASTE** inserts the clipboard; `-`, `/`, `|`, and `~` are one tap away.
+- **A-/A+** change the font size from 12 to 48 and remember it across sessions.
+- The key row stays above the soft keyboard, so Ctrl+C works mid-command.
+- README updated with the new controls.
 
-Open **Terminal** once to install the bootstrap, then load a model and enable Agent. Works best with short, concrete tasks on the 0.8B model.
+Open **Terminal** as before. Agent mode is unchanged and still requires approval for every command.
 
 Install note: this APK is debug-signed by CI, so uninstall any older Lisa build once before installing. Stable signing is still on the roadmap.
-
-SHA-256: `2c92e702a818ab28444020fa7698b4ec04eed65445a4d5cbd7d5ba42205c4c86`

@@ -6,9 +6,9 @@ copy in app storage.
 
 ## Status
 
-Early development (`0.4.0`). One model loaded at a time, CPU inference, ARM64.
-Includes an embedded Termux-style terminal with `pkg`/`apt` support and an approval-based
-agent mode that can run shell commands for the model.
+Early development (`0.5.0`). One model loaded at a time, CPU inference, ARM64.
+Includes an embedded Termux-style terminal with `pkg`/`apt` support, a control-key row,
+and an approval-based agent mode that can run shell commands for the model.
 
 ## What is here
 
@@ -66,6 +66,19 @@ This makes installs slower than in Termux (every package is unpacked and repacke
 needs free temp space while a package is processed. Apt's package cache is cleared after
 installs because the repacked files no longer match the original hashes.
 
+### Terminal controls
+
+A key row sits above the keyboard:
+
+- **Ctrl** and **Alt** toggle latches. With Ctrl on, typing `C` sends Ctrl+C, `D` sends
+  Ctrl+D, and so on. Tap the key again to release it.
+- **Esc**, **Tab**, arrows, Home, End, PgUp, PgDn, and Delete send the expected sequences.
+- **Paste** inserts the clipboard; `-`, `/`, `|`, and `~` are one tap away.
+- **A-/A+** change the font size (12–48) and remember it across sessions.
+
+The terminal still has no shared-storage access and no background service, so long-running
+jobs can be killed when the app is backgrounded.
+
 ## Build
 
 Requirements: JDK 17+, Android SDK platform 35, NDK 27.0.12077973, CMake 3.22.1.
@@ -99,7 +112,6 @@ short context. Larger models are limited by memory bandwidth, not by the app.
 ## Roadmap
 
 - Stable signing so future APKs update over each other.
-- Terminal key row (Ctrl / Alt / Esc / Tab / arrows) and font size.
 - Shared storage and a foreground service for long-running shell jobs.
 - Model settings (context, threads, temperature, system prompt) and a model catalog.
 - Richer agent loop (streamed command output, per-command timeouts, plan review).
