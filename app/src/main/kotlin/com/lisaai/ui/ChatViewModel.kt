@@ -4,6 +4,7 @@ import android.app.Application
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.lisaai.data.ModelDownloader
 import com.lisaai.inference.LlamaEngine
 import com.lisaai.inference.Message
 import com.lisaai.inference.Prompt
@@ -22,6 +23,8 @@ data class ChatUiState(
     val input: String = "",
     val generating: Boolean = false,
     val importing: Boolean = false,
+    val downloading: Boolean = false,
+    val downloadProgress: Float = 0f,
     val modelLoaded: Boolean = false,
     val status: String = "No model loaded",
 )
@@ -35,6 +38,41 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val systemPrompt = "You are Lisa, a concise and helpful assistant running fully on this device."
 
     fun onInput(value: String) = _state.update { it.copy(input = value) }
+
+    fun downloadDefaultModel() {
+        if (_state.value.downloading || _state.value.generating) return
+
+        val app = getApplication<Application>()
+        viewModelScope.launch {
+            _state.update {
+                it.copy(downloading = true, downloadProgress = 0f, status = "Downloading Qwen3.5 0.8B...")
+            }
+
+            val result = runCatching {
+                val folder = File(app.filesDir, "models").apply { mkdirs() }
+                val target = File(folder, "model.gguf")
+                withContext(Dispatchers.IO) {
+                    ModelDownloader.download(DEFAULT_MODEL_URL, target) { fraction ->
+                        _state.update { current -> current.copy(downloadProgress = fraction) }
+                    }
+                }
+                target
+            }
+
+            result
+                .onSuccess { file ->
+                    _state.update {
+                        it.copy(downloading = false, downloadProgress = 1f, status = "Download complete")
+                    }
+                    load(file)
+                }
+                .onFailure {
+                    _state.update { current ->
+                        current.copy(downloading = false, status = "Download failed: ${it.message}")
+                    }
+                }
+        }
+    }
 
     fun importModel(uri: Uri) {
         val app = getApplication<Application>()
@@ -71,11 +109,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             engine.load(file, contextSize = 2048, threads = threads)
                 .onSuccess {
                     _state.update { current ->
-                        current.copy(
-                            importing = false,
-                            modelLoaded = true,
-                            status = "Ready",
-                        )
+                        current.copy(importing = false, modelLoaded = true, status = "Ready")
                     }
                 }
                 .onFailure {
@@ -129,5 +163,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         engine.close()
+    }
+
+    companion object {
+        const val DEFAULT_MODEL_URL =
+            "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf"
     }
 }

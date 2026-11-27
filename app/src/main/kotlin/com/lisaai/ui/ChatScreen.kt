@@ -6,8 +6,10 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
@@ -16,6 +18,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -54,18 +57,25 @@ fun ChatScreen(vm: ChatViewModel = viewModel()) {
                     }
                 },
                 actions = {
-                    Button(
-                        onClick = { picker.launch(arrayOf("*/*")) },
-                        enabled = !state.importing && !state.generating,
-                    ) {
-                        Text(if (state.modelLoaded) "Change model" else "Load model")
+                    if (state.modelLoaded) {
+                        Button(
+                            onClick = { picker.launch(arrayOf("*/*")) },
+                            enabled = !state.importing && !state.generating,
+                        ) {
+                            Text("Change model")
+                        }
                     }
                 },
             )
         },
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
-            MessageList(state, Modifier.weight(1f))
+            MessageList(
+                state = state,
+                modifier = Modifier.weight(1f),
+                onDownload = vm::downloadDefaultModel,
+                onPickFile = { picker.launch(arrayOf("*/*")) },
+            )
             Composer(
                 state = state,
                 onInput = vm::onInput,
@@ -77,7 +87,12 @@ fun ChatScreen(vm: ChatViewModel = viewModel()) {
 }
 
 @Composable
-private fun MessageList(state: ChatUiState, modifier: Modifier = Modifier) {
+private fun MessageList(
+    state: ChatUiState,
+    modifier: Modifier = Modifier,
+    onDownload: () -> Unit,
+    onPickFile: () -> Unit,
+) {
     val listState = rememberLazyListState()
 
     LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.text) {
@@ -92,15 +107,61 @@ private fun MessageList(state: ChatUiState, modifier: Modifier = Modifier) {
     ) {
         if (state.messages.isEmpty()) {
             item {
-                Text(
-                    text = "Choose a GGUF model to begin. A 0.6B model at Q4 is the fastest option for this device.",
-                    textAlign = TextAlign.Center,
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.fillMaxWidth().padding(32.dp),
+                ModelCard(
+                    state = state,
+                    onDownload = onDownload,
+                    onPickFile = onPickFile,
                 )
             }
         }
         items(state.messages) { message -> MessageBubble(message) }
+    }
+}
+
+@Composable
+private fun ModelCard(state: ChatUiState, onDownload: () -> Unit, onPickFile: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text("Lisa", style = MaterialTheme.typography.headlineMedium)
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = "Runs models fully on your phone. Start with Qwen3.5 0.8B (~508 MB, 4-bit).",
+            textAlign = TextAlign.Center,
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Spacer(Modifier.height(20.dp))
+
+        if (state.downloading) {
+            LinearProgressIndicator(
+                progress = { state.downloadProgress },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(10.dp))
+            Text(
+                text = "${(state.downloadProgress * 100).toInt()}%  ·  ${state.status}",
+                style = MaterialTheme.typography.labelMedium,
+            )
+        } else {
+            Button(onClick = onDownload, enabled = !state.importing) {
+                Text("Download Qwen3.5 0.8B")
+            }
+            Spacer(Modifier.height(10.dp))
+            OutlinedButton(onClick = onPickFile, enabled = !state.importing) {
+                Text("Choose GGUF file")
+            }
+        }
+
+        if (state.status.startsWith("Download failed") || state.status.startsWith("Load failed")) {
+            Spacer(Modifier.height(12.dp))
+            Text(
+                text = state.status,
+                textAlign = TextAlign.Center,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
     }
 }
 
