@@ -6,7 +6,8 @@ copy in app storage.
 
 ## Status
 
-Early scaffold (`0.1.0`). One model loaded at a time, CPU inference, ARM64.
+Early development (`0.2.0`). One model loaded at a time, CPU inference, ARM64.
+Includes an embedded Termux-style terminal.
 
 ## What is here
 
@@ -14,6 +15,20 @@ Early scaffold (`0.1.0`). One model loaded at a time, CPU inference, ARM64.
 - `app/src/main/kotlin/com/lisaai/inference` — native binding, engine, UTF-8 streaming,
   and ChatML prompt formatting.
 - `app/src/main/kotlin/com/lisaai/ui` — Compose chat screen and state.
+- `app/src/main/kotlin/com/lisaai/terminal` — bootstrap installer and terminal activity.
+- `terminal-emulator/`, `terminal-view/` — Termux terminal modules (GPL-3.0-only).
+
+## Terminal
+
+The **Terminal** button downloads the Termux aarch64 bootstrap (~30 MB) on first use,
+extracts it into app-private storage, and starts a real `bash`. The bootstrap paths are
+repointed from `com.termux` to `com.lisaai` (both ten characters), which is why the
+applicationId must not change.
+
+`targetSdk` is pinned to 28 so Android allows executing binaries from the private data
+directory. Lisa is sideload-only for this reason.
+
+Package installation through `pkg`/`apt` is not yet repointed and is a later stage.
 
 ## Build
 
@@ -36,10 +51,9 @@ short context. Larger models are limited by memory bandwidth, not by the app.
 
 ## Roadmap
 
-- Embedded terminal (Termux-style) so the assistant can run local commands.
-- Agent loop that can plan and act through that terminal.
+- Repoint `pkg`/`apt` downloads so packages can be installed inside Lisa.
+- Agent loop that can plan and act through the terminal.
 
 ## License
 
-GPL-3.0-only. The embedded terminal stage will vendor GPL-3.0 Termux modules, so the app is
-GPL-3.0 from the start.
+GPL-3.0-only. See `NOTICE` for vendored Termux components.

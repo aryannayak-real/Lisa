@@ -1,0 +1,9 @@
+Lisa includes code from the Termux project.
+
+- terminal-emulator/ and terminal-view/ are derived from
+  https://github.com/termux/termux-app (GPL-3.0-only), with build files adapted
+  to this project's Gradle/CMake setup.
+- The optional terminal bootstrap is downloaded from
+  https://github.com/termux/termux-packages releases and is GPL-3.0-only.
+
+Termux is Copyright (C) Termux contributors.

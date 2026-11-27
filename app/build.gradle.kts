@@ -12,9 +12,11 @@ android {
     defaultConfig {
         applicationId = "com.lisaai"
         minSdk = 26
-        targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        // targetSdk 28 keeps exec permission on the app private data directory,
+        // which the bundled Termux bootstrap requires (sideload-only app).
+        targetSdk = 28
+        versionCode = 2
+        versionName = "0.2.0"
 
         ndk {
             abiFilters += "arm64-v8a"
@@ -74,6 +76,8 @@ dependencies {
     implementation("androidx.compose.material3:material3")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+
+    implementation(project(":terminal-view"))
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

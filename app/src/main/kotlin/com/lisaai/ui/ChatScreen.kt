@@ -1,5 +1,6 @@
 package com.lisaai.ui
 
+import android.content.Intent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -11,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -32,11 +34,13 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.lisaai.inference.Message
 import com.lisaai.inference.Role
+import com.lisaai.terminal.TerminalActivity
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -46,6 +50,8 @@ fun ChatScreen(vm: ChatViewModel = viewModel()) {
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) vm.importModel(uri)
     }
+
+    val context = LocalContext.current
 
     Scaffold(
         topBar = {
@@ -57,6 +63,12 @@ fun ChatScreen(vm: ChatViewModel = viewModel()) {
                     }
                 },
                 actions = {
+                    OutlinedButton(
+                        onClick = { context.startActivity(Intent(context, TerminalActivity::class.java)) },
+                    ) {
+                        Text("Terminal")
+                    }
+                    Spacer(Modifier.width(8.dp))
                     if (state.modelLoaded) {
                         Button(
                             onClick = { picker.launch(arrayOf("*/*")) },

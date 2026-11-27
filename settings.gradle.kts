@@ -16,3 +16,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "Lisa"
 include(":app")
+include(":terminal-emulator")
+include(":terminal-view")
