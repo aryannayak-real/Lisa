@@ -12,7 +12,7 @@ data class AgentProposal(val command: String, val text: String)
  */
 object Agent {
 
-    const val MODE_PROMPT = """
+    val MODE_PROMPT = """
 You are Lisa, a local assistant running on an Android phone with a Termux-compatible shell.
 You can run one shell command at a time in the user's terminal environment.
 
