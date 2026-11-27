@@ -90,7 +90,7 @@ class TerminalActivity : Activity(), TerminalSessionClient, TerminalViewClient {
             return
         }
 
-        val view = TerminalView(this)
+        val view = TerminalView(this, null)
         view.setTerminalViewClient(this)
         view.setTextSize(32)
         view.setBackgroundColor(Color.BLACK)
