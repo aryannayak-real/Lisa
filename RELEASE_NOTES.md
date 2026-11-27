@@ -21,3 +21,5 @@ terminal.
 
 Install note: this APK is debug-signed by CI, so uninstall any older Lisa build once before
 installing. Stable signing is still on the roadmap.
+
+SHA-256: `5a6520b02d90a11e42ec655b32b03c476eb17701babed301d49d4550c2994473`
